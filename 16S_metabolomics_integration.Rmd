@@ -1,0 +1,4596 @@
+---
+title: "16S Microbiome-Metabolomics Integration"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: united
+knit:
+  root.dir: "D:/OneDrive - Emory/Research/Jones R/Mouse Data/MS_10_Antipsychotic/16S Analysis/Nephele_analysis/r_analysis_2"
+---
+
+# Publication-sharing version: 16S-metabolomics integration
+
+This document contains the integrative microbiome-metabolomics workflow extracted from the original notebook. To keep it self-contained for sharing, the setup, package loading, and phyloseq object construction steps are included here before the integration analyses. The downstream sections preserve the original heatmap, network, and DIABLO development history.
+
+# Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+```
+---
+
+### 🧩 Conditional Package Installation Chunk
+
+
+```{r install-packages}
+cran_packages <- c(
+  "ggplot2", "vegan", "patchwork", "data.table", "dplyr", "RColorBrewer",
+  "tidyr", "readr", "gridExtra", "knitr", "stringr", "ggpubr", "ggthemes", "tibble"
+)
+bioc_packages <- c("phyloseq", "DESeq2", "ape")
+
+install_if_missing <- function(pkg) {
+  if (!requireNamespace(pkg, quietly = TRUE)) install.packages(pkg)
+}
+invisible(lapply(cran_packages, install_if_missing))
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+invisible(lapply(bioc_packages, function(pkg) {
+  if (!requireNamespace(pkg, quietly = TRUE)) BiocManager::install(pkg, ask = FALSE, update = FALSE)
+}))
+
+
+```
+
+```{r load-libraries}
+library(phyloseq)
+library(ggplot2)
+library(vegan)
+library(DESeq2)
+library(ape)
+library(patchwork)
+library(data.table)
+library(dplyr)
+library(RColorBrewer)
+library(tidyr)
+library(readr)
+library(knitr)
+library(stringr)
+library(ggpubr)
+library(ggthemes)
+library(tibble)
+library(broom)
+library(phyloseq)
+library(ggplot2)
+library(patchwork)
+library(ggforce)
+library(vegan)
+library(mixOmics)
+library(tibble)
+library(dplyr)
+
+```
+
+# Data loading and phyloseq object construction
+
+```{r load-dada2-and-build-phyloseq}
+seqtab <- readRDS("seqtab_nochimera.rds")
+taxa <- as.matrix(read.table("taxonomy_table.txt", header = TRUE, row.names = 1, sep = "	"))
+tree <- read_tree("rooted_tree.nwk")
+tree$tip.label <- colnames(seqtab)
+rownames(taxa) <- colnames(seqtab)
+
+metadata <- read.table(
+  "mapping_file.txt",
+  header = TRUE,
+  row.names = 1,
+  sep = "	",
+  comment.char = "",
+  check.names = FALSE
+)
+
+common_samples <- intersect(rownames(seqtab), rownames(metadata))
+seqtab <- seqtab[common_samples, ]
+metadata <- metadata[common_samples, ]
+
+metadata <- metadata %>%
+  rownames_to_column("SampleID") %>%
+  mutate(across(everything(), ~ trimws(as.character(.)))) %>%
+  column_to_rownames("SampleID")
+
+ps <- phyloseq(
+  otu_table(seqtab, taxa_are_rows = FALSE),
+  tax_table(taxa),
+  sample_data(metadata),
+  phy_tree(tree)
+)
+
+# Validation checks
+stopifnot(identical(sort(rownames(seqtab)), sort(rownames(metadata))))
+stopifnot(identical(sort(colnames(seqtab)), sort(rownames(taxa))))
+stopifnot(identical(sort(tree$tip.label), sort(colnames(seqtab))))
+
+sample_sums(ps) %>% summary()
+```
+
+# 16S and metabolomics integration 
+```{r}
+
+# ============================================================
+# STEP 1 — Define the single pre-challenge time point + subset
+# Requires: ps already exists
+# Output: ps_pre, meta_pre
+# ============================================================
+
+library(phyloseq)
+library(dplyr)
+library(tibble)
+
+# --- set your pre-challenge time point label here ---
+pre_tp <- "T6"   # change if needed (e.g., "T3")
+
+# Subset to the one time point
+ps_pre <- subset_samples(ps, Time_Point == pre_tp)
+ps_pre <- prune_taxa(taxa_sums(ps_pre) > 0, ps_pre)
+
+# Pull metadata (keep SampleID explicit)
+meta_pre <- data.frame(sample_data(ps_pre), stringsAsFactors = FALSE) %>%
+  rownames_to_column("SampleID") %>%
+  mutate(
+    SampleID = as.character(SampleID),
+    TreatmentGroup = factor(TreatmentGroup),
+    Time_Point = as.character(Time_Point)
+  )
+
+# Quick checks
+cat("Time point kept:", pre_tp, "\n")
+cat("N samples at pre-challenge:", nsamples(ps_pre), "\n")
+print(table(meta_pre$TreatmentGroup))
+stopifnot(all(meta_pre$SampleID %in% sample_names(ps_pre)))
+```
+
+# ============================================================ # STEP 2 — Build a Genus-level CLR table for integration # Requires: ps_pre from Step 1 # Output: genus_clr (samples x genera), meta_pre (aligned) # ============================================================
+```{r}
+library(phyloseq)
+library(dplyr)
+library(tibble)
+library(microbiome)
+
+# 2A) Agglomerate to Genus
+ps_genus <- tax_glom(ps_pre, taxrank = "Genus")
+ps_genus <- prune_taxa(taxa_sums(ps_genus) > 0, ps_genus)
+
+# 2B) Extract count matrix as samples x genera
+genus_mat <- as(otu_table(ps_genus), "matrix")
+if (taxa_are_rows(ps_genus)) genus_mat <- t(genus_mat)
+
+# 2C) Clean genus names (use taxonomy to label columns)
+genus_tax <- as.data.frame(tax_table(ps_genus)) %>%
+  rownames_to_column("FeatureID")
+
+genus_names <- as.character(genus_tax$Genus)
+genus_names[is.na(genus_names) | genus_names == "" |
+              tolower(genus_names) %in% c("none","unclassified","unknown")] <- "Unclassified"
+
+colnames(genus_mat) <- make.unique(genus_names)
+
+# 2D) Prevalence filter (keeps genera present in >= 15% of mice)
+prev <- colMeans(genus_mat > 0)
+keep_genera <- names(prev[prev >= 0.15])
+
+genus_mat_f <- genus_mat[, keep_genera, drop = FALSE]
+
+cat("Genus features (before filter):", ncol(genus_mat), "\n")
+cat("Genus features (after filter): ", ncol(genus_mat_f), "\n")
+
+# 2E) CLR transform (adds pseudocount internally)
+# microbiome::transform expects taxa/features as columns and samples as rows (we have that)
+genus_clr <- microbiome::transform(genus_mat_f, "clr")
+genus_clr <- as.matrix(genus_clr)
+
+# 2F) Align metadata ordering to the CLR matrix
+meta_pre2 <- meta_pre %>%
+  filter(SampleID %in% rownames(genus_clr)) %>%
+  arrange(match(SampleID, rownames(genus_clr)))
+
+stopifnot(identical(meta_pre2$SampleID, rownames(genus_clr)))
+
+# Save aligned metadata back (optional)
+meta_pre <- meta_pre2
+
+# Peek
+cat("CLR matrix dim (samples x genera): ", paste(dim(genus_clr), collapse=" x "), "\n")
+head(genus_clr[, 1:min(6, ncol(genus_clr))])
+```
+
+```{r}
+# ============================================================
+# STEP 3 — Load untargeted metabolomics and align to 16S
+# Requires: genus_clr, meta_pre
+# Output: metab_mat (samples x features), shared_ids
+# ============================================================
+
+library(readr)
+library(dplyr)
+library(tibble)
+
+# ---- metabolomics file path (Windows-safe) ----
+metab_file <- "D:\\OneDrive - Emory\\Research\\LCMS\\Gacasan_Mouse_Stool_Antipsychotics_JW_12282025\\hilicpos\\Merge\\metabolomics_features_prechallenge.csv"
+
+# Load metabolomics table
+metab_raw <- read_csv(metab_file)
+
+cat("Raw metabolomics table dimensions:", dim(metab_raw), "\n")
+cat("First few column names:\n")
+print(colnames(metab_raw)[1:6])
+
+# Expect: first column = SampleID, remaining columns = numeric features
+metab_mat <- metab_raw %>%
+  rename(SampleID = 1) %>%
+  mutate(SampleID = as.character(SampleID)) %>%
+  column_to_rownames("SampleID") %>%
+  as.matrix()
+
+# -------------------------------
+# Sample alignment diagnostics
+# -------------------------------
+samples_16S <- rownames(genus_clr)
+samples_met <- rownames(metab_mat)
+
+missing_in_metab <- setdiff(samples_16S, samples_met)
+missing_in_16S   <- setdiff(samples_met, samples_16S)
+
+cat("\nSamples present in 16S but missing in metabolomics:\n")
+print(missing_in_metab)
+
+cat("\nSamples present in metabolomics but missing in 16S:\n")
+print(missing_in_16S)
+
+# -------------------------------
+# Restrict to shared samples ONLY
+# -------------------------------
+shared_ids <- intersect(samples_16S, samples_met)
+
+cat("\nSample counts:\n")
+cat("  16S total:", length(samples_16S), "\n")
+cat("  Metabolomics total:", length(samples_met), "\n")
+cat("  Used for integration:", length(shared_ids), "\n")
+
+# Subset all objects
+genus_clr <- genus_clr[shared_ids, , drop = FALSE]
+metab_mat <- metab_mat[shared_ids, , drop = FALSE]
+meta_pre  <- meta_pre %>%
+  filter(SampleID %in% shared_ids) %>%
+  arrange(match(SampleID, shared_ids))
+
+# Final alignment check (MUST be TRUE)
+stopifnot(
+  identical(rownames(genus_clr), rownames(metab_mat)),
+  identical(rownames(genus_clr), meta_pre$SampleID)
+)
+
+cat("\nFinal aligned dimensions:\n")
+cat("  genus_clr:", paste(dim(genus_clr), collapse = " x "), "\n")
+cat("  metab_mat:", paste(dim(metab_mat), collapse = " x "), "\n")
+```
+
+# ============================================================ # STEP 4 — Preprocess metabolomics matrix for integration # Input: metab_mat (samples x metabolites) # Output: metab_proc (samples x metabolites), plus a QC summary # ============================================================
+```{r}
+library(dplyr)
+
+# ---- 4A) Coerce to numeric safely ----
+metab_proc <- metab_mat
+mode(metab_proc) <- "numeric"
+
+# ---- 4B) Basic missingness summary ----
+na_perc_by_metab <- colMeans(is.na(metab_proc)) * 100
+cat("Metabolites with any NA:", sum(na_perc_by_metab > 0), "of", ncol(metab_proc), "\n")
+
+# ---- 4C) Drop metabolites with too much missingness (tunable) ----
+max_na_pct <- 20   # keep metabolites with <=20% missing values
+keep_cols <- na_perc_by_metab <= max_na_pct
+metab_proc <- metab_proc[, keep_cols, drop = FALSE]
+
+cat("After NA-filter:", dim(metab_proc)[1], "x", dim(metab_proc)[2], "\n")
+
+# ---- 4D) Impute remaining NA with half-minimum per metabolite (common LCMS approach) ----
+halfmin_impute <- function(x) {
+  if (all(is.na(x))) return(rep(NA_real_, length(x)))
+  mn <- suppressWarnings(min(x[x > 0], na.rm = TRUE))
+  if (is.infinite(mn) || is.na(mn)) mn <- suppressWarnings(min(x, na.rm = TRUE))
+  x[is.na(x)] <- 0.5 * mn
+  x
+}
+metab_proc <- apply(metab_proc, 2, halfmin_impute)
+metab_proc <- as.matrix(metab_proc)
+
+# ---- 4E) log transform (stabilizes variance) ----
+metab_proc <- log1p(metab_proc)
+
+# ---- 4F) Variance filter (optional but recommended) ----
+# keep top X% most variable metabolites to reduce noise for integration
+top_var_frac <- 1.00   # set to 0.50 to keep top 50%, etc.
+vars <- apply(metab_proc, 2, var, na.rm = TRUE)
+keepN <- ceiling(length(vars) * top_var_frac)
+keep_metabs <- names(sort(vars, decreasing = TRUE))[1:keepN]
+metab_proc <- metab_proc[, keep_metabs, drop = FALSE]
+
+cat("After variance filter:", dim(metab_proc)[1], "x", dim(metab_proc)[2], "\n")
+
+# ---- 4G) Autoscale (z-score) per metabolite ----
+metab_proc <- scale(metab_proc)
+
+# ---- 4H) Final sanity checks ----
+stopifnot(identical(rownames(metab_proc), rownames(genus_clr)))
+cat("✅ metab_proc ready. Dim:", paste(dim(metab_proc), collapse=" x "), "\n")
+```
+
+
+# ============================================================ # STEP 5A.1 — Genus ↔ metabolite associations (Spearman) # Input: genus_clr (23 x 82), metab_proc (23 x 413) # Output: assoc_raw (long table with rho, p, FDR) # ============================================================
+```{r}
+library(Hmisc)
+library(dplyr)
+
+# Combine matrices for rcorr
+X <- cbind(genus_clr, metab_proc)
+
+# Spearman correlations
+cors <- rcorr(X, type = "spearman")
+
+# Extract matrices
+rmat <- cors$r
+pmat <- cors$P
+
+genera     <- colnames(genus_clr)
+metabolts <- colnames(metab_proc)
+
+# Subset to genus (rows) x metabolite (cols)
+r_gm <- rmat[genera, metabolts, drop = FALSE]
+p_gm <- pmat[genera, metabolts, drop = FALSE]
+
+# Convert to long format
+assoc_raw <- as.data.frame(as.table(r_gm)) %>%
+  rename(
+    Genus = Var1,
+    Metabolite = Var2,
+    rho = Freq
+  ) %>%
+  mutate(
+    p = as.vector(p_gm),
+    padj = p.adjust(p, method = "BH")
+  ) %>%
+  arrange(padj)
+
+# Summary
+cat("Total genus–metabolite tests:", nrow(assoc_raw), "\n")
+cat("Significant at FDR < 0.05:", sum(assoc_raw$padj < 0.05), "\n")
+
+head(assoc_raw, 10)
+```
+
+# ============================================================ # STEP 5A.2 — Treatment-adjusted genus ↔ metabolite associations # Residualize both blocks on TreatmentGroup, then correlate # ============================================================ # ============================================================ # STEP 5A.2 FIX v2 — Feature-wise robust residualization # (handles per-feature collapse to 1 TreatmentGroup after NA/Inf filtering) # ============================================================
+```{r}
+library(dplyr)
+
+# Quick diagnostics (should be 0)
+cat("Any NA in genus_clr?  ", any(!is.finite(as.matrix(genus_clr))), "\n")
+cat("Any NA in metab_proc? ", any(!is.finite(as.matrix(metab_proc))), "\n")
+cat("Any NA in TreatmentGroup? ", any(is.na(meta_pre$TreatmentGroup)), "\n")
+cat("TreatmentGroup table:\n")
+print(table(meta_pre$TreatmentGroup, useNA = "ifany"))
+
+residualize_mat_safe <- function(mat, meta, rhs = "TreatmentGroup") {
+  rhs_all <- droplevels(factor(meta[[rhs]]))
+  if (nlevels(rhs_all) < 2) {
+    message("⚠️ ", rhs, " has <2 levels overall. Using mean-centering for all features.")
+    return(scale(mat, center = TRUE, scale = FALSE))
+  }
+  
+  out <- matrix(NA_real_, nrow(mat), ncol(mat),
+                dimnames = list(rownames(mat), colnames(mat)))
+  
+  n_fallback <- 0L
+  
+  for (j in seq_len(ncol(mat))) {
+    y <- mat[, j]
+    ok <- is.finite(y) & !is.na(rhs_all)
+    
+    rhs_use <- droplevels(rhs_all[ok])
+    y_use   <- y[ok]
+    
+    # If this feature collapses to 1 level after filtering, fallback
+    if (length(y_use) < 3 || nlevels(rhs_use) < 2) {
+      out[, j] <- y - mean(y, na.rm = TRUE)
+      n_fallback <- n_fallback + 1L
+      next
+    }
+    
+    df <- data.frame(y = y_use, grp = rhs_use)
+    fit <- lm(y ~ grp, data = df)
+    
+    # Put residuals back in correct rows; untouched rows get mean-centered
+    res_full <- y - mean(y, na.rm = TRUE)
+    res_full[ok] <- resid(fit)
+    out[, j] <- res_full
+  }
+  
+  cat("Residualization fallback (mean-centered) for", n_fallback, "features out of", ncol(mat), "\n")
+  out
+}
+
+genus_res <- residualize_mat_safe(genus_clr, meta_pre, rhs = "TreatmentGroup")
+metab_res <- residualize_mat_safe(metab_proc, meta_pre, rhs = "TreatmentGroup")
+
+cat("✅ Residualized dims:\n")
+cat("  genus_res:", paste(dim(genus_res), collapse=" x "), "\n")
+cat("  metab_res:", paste(dim(metab_res), collapse=" x "), "\n")
+```
+
+# ============================================================ # STEP 5B (robust) — Genus ↔ Metabolite Spearman correlations + FDR # Handles low-N / non-finite / zero-variance pairs safely # ============================================================
+```{r}
+library(dplyr)
+
+compute_assoc_spearman_safe <- function(X, Y, min_n = 6) {
+  stopifnot(nrow(X) == nrow(Y))
+  
+  Xn <- colnames(X)
+  Yn <- colnames(Y)
+  
+  out <- vector("list", length = length(Xn) * length(Yn))
+  k <- 1L
+  skipped <- 0L
+  
+  for (i in seq_along(Xn)) {
+    xi_all <- X[, i]
+    
+    for (j in seq_along(Yn)) {
+      yj_all <- Y[, j]
+      
+      ok <- is.finite(xi_all) & is.finite(yj_all)
+      xi <- xi_all[ok]
+      yj <- yj_all[ok]
+      
+      # skip if too few points or either vector has zero variance
+      if (sum(ok) < min_n || sd(xi) == 0 || sd(yj) == 0) {
+        out[[k]] <- data.frame(
+          Genus = Xn[i],
+          Metabolite = Yn[j],
+          rho = NA_real_,
+          p = NA_real_,
+          n = sum(ok),
+          skipped = TRUE,
+          stringsAsFactors = FALSE
+        )
+        skipped <- skipped + 1L
+        k <- k + 1L
+        next
+      }
+      
+      ct <- suppressWarnings(cor.test(xi, yj, method = "spearman", exact = FALSE))
+      out[[k]] <- data.frame(
+        Genus = Xn[i],
+        Metabolite = Yn[j],
+        rho = unname(ct$estimate),
+        p = ct$p.value,
+        n = sum(ok),
+        skipped = FALSE,
+        stringsAsFactors = FALSE
+      )
+      k <- k + 1L
+    }
+  }
+  
+  res <- bind_rows(out) %>%
+    mutate(
+      p_adj = ifelse(is.na(p), NA_real_, p.adjust(p, method = "BH"))
+    )
+  
+  cat("Total pairs:", nrow(res), "\n")
+  cat("Skipped pairs (min_n/zero-variance):", skipped, "\n")
+  cat("Tested pairs:", sum(!res$skipped), "\n")
+  
+  res
+}
+
+# ---- Run associations safely ----
+assoc_adj <- compute_assoc_spearman_safe(genus_res, metab_res, min_n = 6)
+
+# ---- Summaries ----
+cat("FDR < 0.05 (tested pairs only):",
+    sum(!assoc_adj$skipped & assoc_adj$p_adj < 0.05, na.rm = TRUE), "\n")
+
+# ---- Save full edge list ----
+write.csv(
+  assoc_adj,
+  file = file.path(root.dir, "integration_T6_genus_metabolite_spearman_edges_adjusted.csv"),
+  row.names = FALSE
+)
+
+# ---- Export top hits (by FDR; exclude skipped/NA) ----
+top_edges <- assoc_adj %>%
+  filter(!skipped, !is.na(p_adj)) %>%
+  arrange(p_adj) %>%
+  slice_head(n = 200)
+
+write.csv(
+  top_edges,
+  file = file.path(root.dir, "integration_T6_top200_edges_adjusted.csv"),
+  row.names = FALSE
+)
+
+# ---- "Strong + significant" subset ----
+edge_sig <- assoc_adj %>%
+  filter(!skipped, !is.na(p_adj), p_adj < 0.05, abs(rho) >= 0.5) %>%
+  arrange(p_adj)
+
+write.csv(
+  edge_sig,
+  file = file.path(root.dir, "integration_T6_edges_FDR0p05_absRho0p5.csv"),
+  row.names = FALSE
+)
+
+cat("Saved:\n",
+    " - integration_T6_genus_metabolite_spearman_edges_adjusted.csv\n",
+    " - integration_T6_top200_edges_adjusted.csv\n",
+    " - integration_T6_edges_FDR0p05_absRho0p5.csv\n")
+```
+
+# ============================================================ # STEP 6A — Select top associations for visualization # ============================================================
+```{r}
+library(dplyr)
+library(tidyr)
+
+# Use strong + significant edges
+heat_edges <- assoc_adj %>%
+  filter(
+    !skipped,
+    !is.na(p_adj),
+    p_adj < 0.05,
+    abs(rho) >= 0.5
+  )
+
+cat("Edges for heatmap:", nrow(heat_edges), "\n")
+
+# Limit size if needed (keeps heatmap readable)
+max_edges <- 300
+if (nrow(heat_edges) > max_edges) {
+  heat_edges <- heat_edges %>%
+    arrange(p_adj) %>%
+    slice_head(n = max_edges)
+}
+
+# Convert to wide matrix (Genus x Metabolite)
+heat_mat <- heat_edges %>%
+  select(Genus, Metabolite, rho) %>%
+  pivot_wider(
+    names_from = Metabolite,
+    values_from = rho,
+    values_fill = 0
+  ) %>%
+  column_to_rownames("Genus") %>%
+  as.matrix()
+
+cat("Heatmap matrix dim:",
+    paste(dim(heat_mat), collapse = " x "), "\n")
+```
+
+# ============================================================ # STEP 6A1 — Diagnose edge counts under different thresholds # ============================================================
+```{r}
+library(dplyr)
+
+# Basic counts
+cat("Total pairs:", nrow(assoc_adj), "\n")
+cat("Skipped pairs:", sum(assoc_adj$skipped), "\n")
+cat("Tested pairs:", sum(!assoc_adj$skipped), "\n")
+
+tested <- assoc_adj %>% filter(!skipped, is.finite(rho), !is.na(p_adj))
+
+cat("Tested (finite rho, has p_adj):", nrow(tested), "\n")
+
+# How many significant at different FDR cutoffs?
+for (a in c(0.20, 0.10, 0.05)) {
+  cat("p_adj <", a, ":", sum(tested$p_adj < a, na.rm = TRUE), "\n")
+}
+
+# How many "strong" at different rho cutoffs?
+for (r in c(0.6, 0.5, 0.4, 0.3, 0.25, 0.2)) {
+  cat("|rho| >=", r, ":", sum(abs(tested$rho) >= r, na.rm = TRUE), "\n")
+}
+
+# Combined grid (quick view)
+grid <- expand.grid(
+  padj = c(0.20, 0.10, 0.05),
+  rho  = c(0.5, 0.4, 0.3, 0.25, 0.2),
+  stringsAsFactors = FALSE
+)
+
+grid$n_edges <- mapply(function(p, r) {
+  sum(tested$p_adj < p & abs(tested$rho) >= r, na.rm = TRUE)
+}, grid$padj, grid$rho)
+
+grid <- grid %>% arrange(padj, desc(rho))
+print(grid)
+```
+
+# ============================================================ # STEP 6A — Exploratory heatmap of top genus–metabolite associations # (ranked by effect size; not FDR-significant) # ============================================================
+```{r}
+library(dplyr)
+library(tidyr)
+library(tibble)
+
+# Use tested (non-skipped) pairs only
+tested <- assoc_adj %>%
+  filter(!skipped, is.finite(rho), !is.na(p_adj))
+
+# Select top edges by absolute rho
+topN <- 200   # adjust if you want denser/sparser
+heat_edges <- tested %>%
+  arrange(desc(abs(rho))) %>%
+  slice_head(n = topN)
+
+cat("Using top", nrow(heat_edges), "edges by |rho|\n")
+cat("rho range:", range(heat_edges$rho), "\n")
+
+# Pivot to Genus x Metabolite matrix
+heat_mat <- heat_edges %>%
+  select(Genus, Metabolite, rho) %>%
+  pivot_wider(
+    names_from = Metabolite,
+    values_from = rho,
+    values_fill = 0
+  ) %>%
+  column_to_rownames("Genus") %>%
+  as.matrix()
+
+cat("Heatmap matrix dim:", paste(dim(heat_mat), collapse = " x "), "\n")
+```
+
+# ============================================================ # STEP 6B — Plot exploratory heatmap # ============================================================
+```{r}
+library(ComplexHeatmap)
+library(circlize)
+
+col_fun <- colorRamp2(
+  c(-1, 0, 1),
+  c("#4575b4", "white", "#d73027")
+)
+
+# Row-scale for pattern visibility
+heat_mat_scaled <- t(scale(t(heat_mat)))
+heat_mat_scaled[is.na(heat_mat_scaled)] <- 0
+
+ht <- Heatmap(
+  heat_mat_scaled,
+  name = "Spearman\nrho",
+  col = col_fun,
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  show_row_names = TRUE,
+  show_column_names = FALSE,
+  row_names_gp = gpar(fontsize = 9),
+  column_title = "Metabolites",
+  row_title = "Genera",
+  heatmap_legend_param = list(
+    title = "ρ (exploratory)"
+  )
+)
+
+draw(ht)
+
+# Save
+pdf(file.path(root.dir, "integration_T6_genus_metabolite_heatmap_exploratory.pdf"),
+    width = 10, height = 8)
+draw(ht)
+dev.off()
+```
+
+# ============================================================ # STEP 6B (debug) — Heatmap WITH metabolite labels # ============================================================
+```{r}
+library(ComplexHeatmap)
+library(circlize)
+
+cat("heat_mat dim:", paste(dim(heat_mat), collapse=" x "), "\n")
+stopifnot(nrow(heat_mat) > 1, ncol(heat_mat) > 1)
+
+
+col_fun <- colorRamp2(c(-1, 0, 1), c("#4575b4", "white", "#d73027"))
+
+heat_mat_scaled <- t(scale(t(heat_mat)))
+heat_mat_scaled[is.na(heat_mat_scaled)] <- 0
+
+ht <- Heatmap(
+  heat_mat_scaled,
+  name = "Spearman\nrho",
+  col = col_fun,
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  show_row_names = TRUE,
+  show_column_names = TRUE,   # 🔹 TURNED ON
+  row_names_gp = gpar(fontsize = 9),
+  column_names_gp = gpar(fontsize = 6, rot = 45),
+  row_title = "Genera",
+  column_title = "Metabolites"
+)
+
+draw(ht)
+```
+
+# ============================================================ # STEP 7A — Safe Spearman correlations (genus_res vs metab_res) # Output: assoc_df with Genus, Metabolite, rho, p, padj, n # ============================================================
+```{r}
+library(dplyr)
+library(tidyr)
+
+stopifnot(identical(rownames(genus_res), rownames(metab_res)))
+
+X <- as.matrix(genus_res)  # samples x genera
+Y <- as.matrix(metab_res)  # samples x metabolites
+
+n <- nrow(X)
+
+# Drop constant columns (sd == 0), which cause NA correlations
+x_sd <- apply(X, 2, sd, na.rm = TRUE)
+y_sd <- apply(Y, 2, sd, na.rm = TRUE)
+
+X2 <- X[, x_sd > 0, drop = FALSE]
+Y2 <- Y[, y_sd > 0, drop = FALSE]
+
+cat("Non-constant genera:", ncol(X2), "of", ncol(X), "\n")
+cat("Non-constant metabolites:", ncol(Y2), "of", ncol(Y), "\n")
+
+# Spearman via ranks + Pearson correlation on ranks (fast)
+Xr <- apply(X2, 2, rank, ties.method = "average")
+Yr <- apply(Y2, 2, rank, ties.method = "average")
+
+rho_mat <- cor(Xr, Yr, method = "pearson")  # genera x metabolites
+
+# p-values (approx) using t statistic
+# t = rho * sqrt((n-2)/(1-rho^2))
+rho2 <- pmin(pmax(rho_mat, -0.999999), 0.999999)  # avoid division issues
+t_mat <- rho2 * sqrt((n - 2) / pmax(1 - rho2^2, 1e-12))
+p_mat <- 2 * pt(abs(t_mat), df = n - 2, lower.tail = FALSE)
+
+assoc_df <- as.data.frame(as.table(rho_mat)) %>%
+  rename(Genus = Var1, Metabolite = Var2, rho = Freq) %>%
+  mutate(
+    p = as.vector(p_mat),
+    padj = p.adjust(p, method = "BH"),
+    n = n
+  ) %>%
+  filter(is.finite(rho), is.finite(p))
+
+cat("Total tested pairs:", nrow(assoc_df), "\n")
+summary(assoc_df$rho)
+```
+
+# ============================================================ # STEP 7B — Select top edges (strongest relationships) # ============================================================
+```{r}
+topN <- 200     # try 100–400; adjust for readability
+min_abs_rho <- 0.35  # optional safety threshold
+
+top_edges <- assoc_df %>%
+  mutate(abs_rho = abs(rho)) %>%
+  filter(abs_rho >= min_abs_rho) %>%
+  arrange(desc(abs_rho), padj) %>%
+  slice_head(n = topN)
+
+cat("Top edges kept:", nrow(top_edges), "\n")
+top_edges %>% select(Genus, Metabolite, rho, p, padj) %>% head(10)
+```
+
+# ============================================================ # STEP 7C — Build heatmap matrix from top edges # ============================================================
+```{r}
+heat_mat <- top_edges %>%
+  select(Genus, Metabolite, rho) %>%
+  pivot_wider(names_from = Metabolite, values_from = rho, values_fill = 0) %>%
+  tibble::column_to_rownames("Genus") %>%
+  as.matrix()
+
+cat("Heatmap matrix dim:", paste(dim(heat_mat), collapse=" x "), "\n")
+```
+# ============================================================ # STEP 7D — Heatmap (top relationships only) + save # ============================================================
+```{R}
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+
+col_fun <- colorRamp2(c(-1, 0, 1), c("#4575b4", "white", "#d73027"))
+
+# Optional: row-scale so patterns pop (safe for 0-filled rows)
+heat_mat_scaled <- t(scale(t(heat_mat)))
+heat_mat_scaled[is.na(heat_mat_scaled)] <- 0
+
+ht <- Heatmap(
+  heat_mat_scaled,
+  name = "Spearman\nrho",
+  col = col_fun,
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  row_names_gp = gpar(fontsize = 9),
+  column_names_gp = gpar(fontsize = 6, rot = 45),
+  row_title = "Genera (top edges)",
+  column_title = "Metabolites (top edges)",
+  use_raster = TRUE
+)
+
+# Save PDF (most reliable)
+pdf(file.path(root.dir, "T6_integration_heatmap_top_edges.pdf"), width = 14, height = 9)
+draw(ht)
+dev.off()
+
+# Save PNG (good for slides/manuscript drafts)
+if (!requireNamespace("ragg", quietly = TRUE)) install.packages("ragg")
+ragg::agg_png(file.path(root.dir, "T6_integration_heatmap_top_edges.png"),
+              width = 2400, height = 1600, res = 200)
+draw(ht)
+dev.off()
+
+cat("✅ Saved:\n",
+    file.path(root.dir, "T6_integration_heatmap_top_edges.pdf"), "\n",
+    file.path(root.dir, "T6_integration_heatmap_top_edges.png"), "\n")
+```
+# ============================================================ # How many metabolites are in the heatmap? # ============================================================
+```{r}
+cat("Number of metabolites in heatmap:", ncol(heat_mat), "\n")
+cat("Number of genera in heatmap:", nrow(heat_mat), "\n")
+```
+
+# ============================================================ # STEP 7E (FIXED) — Select top 50 metabolites and genera # Explicit dplyr namespace to avoid plyr conflict # ============================================================
+```{r}
+# Confirm dplyr is loaded last
+library(dplyr)
+
+# Use assoc_df (full association table)
+assoc_use <- assoc_df %>%
+  filter(is.finite(rho))
+
+# ---- Top 50 metabolites by max |rho| ----
+top_metabolites <- assoc_use %>%
+  group_by(Metabolite) %>%
+  dplyr::summarize(
+    max_abs_rho = max(abs(rho), na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(max_abs_rho)) %>%
+  slice_head(n = 50) %>%
+  pull(Metabolite)
+
+cat("Top metabolites selected:", length(top_metabolites), "\n")
+
+# ---- Top 50 genera by max |rho| ----
+top_genera <- assoc_use %>%
+  group_by(Genus) %>%
+  dplyr::summarize(
+    max_abs_rho = max(abs(rho), na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(max_abs_rho)) %>%
+  slice_head(n = 50) %>%
+  pull(Genus)
+
+cat("Top genera selected:", length(top_genera), "\n")
+```
+
+# ============================================================ # STEP 7F — Rebuild heatmap matrix (top 50 x top 50) # ============================================================
+```{r}
+library(tidyr)
+library(tibble)
+
+heat_mat_50 <- assoc_use %>%
+  filter(
+    Genus %in% top_genera,
+    Metabolite %in% top_metabolites
+  ) %>%
+  select(Genus, Metabolite, rho) %>%
+  pivot_wider(
+    names_from = Metabolite,
+    values_from = rho,
+    values_fill = 0
+  ) %>%
+  column_to_rownames("Genus") %>%
+  as.matrix()
+
+cat("Heatmap (50x50) dim:",
+    paste(dim(heat_mat_50), collapse = " x "), "\n")
+```
+# ============================================================ # STEP 7G — Heatmap: Top 50 metabolites x Top 50 genera # ============================================================
+```{r}
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+
+col_fun <- colorRamp2(
+  c(-1, 0, 1),
+  c("#A8DADC", "white", "#F4A261")
+)
+
+# Row-scale for pattern clarity
+heat_mat_50_scaled <- t(scale(t(heat_mat_50)))
+heat_mat_50_scaled[is.na(heat_mat_50_scaled)] <- 0
+
+ht_50 <- Heatmap(
+  heat_mat_50_scaled,
+  name = "Spearman\nrho",
+  col = col_fun,
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  row_names_gp = gpar(fontsize = 9),
+  column_names_gp = gpar(fontsize = 7, rot = 45),
+  row_title = "Top 50 genera",
+  column_title = "Top 50 metabolites",
+  use_raster = TRUE
+)
+
+# Save PDF
+pdf(file.path(root.dir, "T6_integration_heatmap_top50x50.pdf"),
+    width = 14, height = 10)
+draw(ht_50)
+dev.off()
+
+# Save PNG
+if (!requireNamespace("ragg", quietly = TRUE)) install.packages("ragg")
+ragg::agg_png(
+  file.path(root.dir, "T6_integration_heatmap_top50x50.png"),
+  width = 2600, height = 1800, res = 200
+)
+draw(ht_50)
+dev.off()
+
+cat("✅ Saved:\n",
+    file.path(root.dir, "T6_integration_heatmap_top50x50.pdf"), "\n",
+    file.path(root.dir, "T6_integration_heatmap_top50x50.png"), "\n")
+```
+
+
+rEBUILDING THE 50X50 HEAATMAP WITHOUT ANY NONES
+```{r}
+###TRYING TO REBUILD WITHOUT THE nones
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+
+# ------------------------------------------------------------
+# 1. Clean genus labels first
+# ------------------------------------------------------------
+assoc_use_clean <- assoc_use %>%
+  mutate(
+    Genus = as.character(Genus),
+    Genus = str_trim(Genus)
+  )
+
+# Check what "none-like" labels are present
+sort(unique(assoc_use_clean$Genus[grepl("none|unassigned|uncultured|na", 
+                                        assoc_use_clean$Genus, 
+                                        ignore.case = TRUE)]))
+
+# ------------------------------------------------------------
+# 2. Remove junk genus labels
+# ------------------------------------------------------------
+assoc_use_no_none <- assoc_use_clean %>%
+  filter(
+    !is.na(Genus),
+    Genus != "",
+    !grepl("^none(\\.|$)", Genus, ignore.case = TRUE),
+    !grepl("^na(\\.|$)", Genus, ignore.case = TRUE),
+    !grepl("^unassigned(\\.|$)", Genus, ignore.case = TRUE),
+    !grepl("^uncultured(\\.|$)", Genus, ignore.case = TRUE)
+  )
+
+# ------------------------------------------------------------
+# 3. Re-select top 50 genera after filtering
+# ------------------------------------------------------------
+top_genera_no_none <- assoc_use_no_none %>%
+  group_by(Genus) %>%
+  summarise(max_abs_rho = max(abs(rho), na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(max_abs_rho)) %>%
+  slice_head(n = 50) %>%
+  pull(Genus)
+
+# ------------------------------------------------------------
+# 4. Re-select top 50 metabolites after filtering
+# ------------------------------------------------------------
+top_metabolites_no_none <- assoc_use_no_none %>%
+  group_by(Metabolite) %>%
+  summarise(max_abs_rho = max(abs(rho), na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(max_abs_rho)) %>%
+  slice_head(n = 50) %>%
+  pull(Metabolite)
+
+# ------------------------------------------------------------
+# 5. Build clean 50 x 50 matrix
+# ------------------------------------------------------------
+heat_mat_50_no_none <- assoc_use_no_none %>%
+  filter(
+    Genus %in% top_genera_no_none,
+    Metabolite %in% top_metabolites_no_none
+  ) %>%
+  select(Genus, Metabolite, rho) %>%
+  pivot_wider(
+    names_from = Metabolite,
+    values_from = rho,
+    values_fill = 0
+  ) %>%
+  column_to_rownames("Genus") %>%
+  as.matrix()
+
+cat("Heatmap dim:", paste(dim(heat_mat_50_no_none), collapse = " x "), "\n")
+cat("Remaining none-like genera:\n")
+print(rownames(heat_mat_50_no_none)[grepl("none|unassigned|uncultured|na",
+                                          rownames(heat_mat_50_no_none),
+                                          ignore.case = TRUE)])
+
+# ------------------------------------------------------------
+# 6. Row-scale
+# ------------------------------------------------------------
+heat_mat_50_scaled <- t(scale(t(heat_mat_50_no_none)))
+heat_mat_50_scaled[is.na(heat_mat_50_scaled)] <- 0
+
+# ------------------------------------------------------------
+# 7. Heatmap colors
+# ------------------------------------------------------------
+col_fun <- colorRamp2(
+  c(-1, 0, 1),
+  c("#A8DADC", "white", "#F4A261")
+)
+
+# ------------------------------------------------------------
+# 8. Plot heatmap
+# ------------------------------------------------------------
+ht_50 <- Heatmap(
+  heat_mat_50_scaled,
+  name = "Spearman\nrho",
+  col = col_fun,
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  row_names_gp = gpar(fontsize = 9),
+  column_names_gp = gpar(fontsize = 7, rot = 45),
+  row_title = "Top 50 genera",
+  column_title = "Top 50 metabolites",
+  use_raster = TRUE
+)
+
+# Save PDF
+pdf(file.path(root.dir, "T6_integration_heatmap_top50x50_clean.pdf"),
+    width = 14, height = 10)
+draw(ht_50)
+dev.off()
+
+# Save PNG
+if (!requireNamespace("ragg", quietly = TRUE)) install.packages("ragg")
+ragg::agg_png(
+  file.path(root.dir, "T6_integration_heatmap_top50x50_clean.png"),
+  width = 2600, height = 1800, res = 200
+)
+draw(ht_50)
+dev.off()
+
+cat("✅ Saved clean heatmap files\n")
+
+# ------------------------------------------------------------
+# Save RAW correlation matrix (rho values)
+# ------------------------------------------------------------
+write.csv(
+  heat_mat_50_no_none,
+  file = file.path(root.dir, "T6_heatmap_top50x50_no_none_raw_rho.csv"),
+  row.names = TRUE
+)
+
+# ------------------------------------------------------------
+# Save ROW-SCALED matrix (what is actually plotted)
+# ------------------------------------------------------------
+write.csv(
+  heat_mat_50_scaled,
+  file = file.path(root.dir, "T6_heatmap_top50x50_no_none_scaled.csv"),
+  row.names = TRUE
+)
+
+cat("✅ Saved CSVs:\n",
+    file.path(root.dir, "T6_heatmap_top50x50_no_none_raw_rho.csv"), "\n",
+    file.path(root.dir, "T6_heatmap_top50x50_no_none_scaled.csv"), "\n")
+
+heat_long <- assoc_use_no_none %>%
+  filter(
+    Genus %in% top_genera_no_none,
+    Metabolite %in% top_metabolites_no_none
+  )
+
+write.csv(
+  heat_long,
+  file = file.path(root.dir, "T6_heatmap_top50x50_no_none_long_format.csv"),
+  row.names = FALSE
+)
+```
+
+
+# ============================================================ # Save quantitative heatmap data (rho values) # ============================================================
+```{r}
+# heat_mat_50 contains raw Spearman rho values (not scaled)
+heatmap_quantitative_df <- as.data.frame(heat_mat_50) %>%
+  tibble::rownames_to_column("Genus")
+
+write.csv(
+  heatmap_quantitative_df,
+  file = file.path(root.dir, "T6_heatmap_top50x50_rho_values.csv"),
+  row.names = FALSE
+)
+
+cat("✅ Saved quantitative heatmap data to:\n",
+    file.path(root.dir, "T6_heatmap_top50x50_rho_values.csv"), "\n")
+
+# ============================================================
+# Save heatmap data in long (tidy) format
+# ============================================================
+
+heatmap_quantitative_long <- heatmap_quantitative_df %>%
+  tidyr::pivot_longer(
+    cols = -Genus,
+    names_to = "Metabolite",
+    values_to = "Spearman_rho"
+  )
+
+write.csv(
+  heatmap_quantitative_long,
+  file = file.path(root.dir, "T6_heatmap_top50x50_rho_values_long.csv"),
+  row.names = FALSE
+)
+
+cat("✅ Saved long-format heatmap data to:\n",
+    file.path(root.dir, "T6_heatmap_top50x50_rho_values_long.csv"), "\n")
+```
+
+# ============================================================ # STEP 9B (revised) — Use the FULL set of "top metabolites" # (i.e., the metabolites currently in your heatmap) # ============================================================
+{r}
+library(dplyr)
+
+# Use your existing heatmap metabolite set as the definition of "top metabolites"
+# (You reported: Number of metabolites in heatmap: 139)
+top_metabolites_full <- colnames(heat_mat)  # or heat_mat_50 if that's the object you have
+
+stopifnot(length(top_metabolites_full) > 0)
+
+cat("Top metabolites (from heatmap):", length(top_metabolites_full), "\n")
+head(top_metabolites_full)
+{r}
+# ============================================================
+# STEP 9C (revised) — Filter edges to ALL top metabolites
+#   (keep genus unconstrained for now)
+# ============================================================
+
+# Expecting your long-format association table:
+# assoc_use with columns: Genus, Metabolite, rho, padj (optional)
+edges_raw <- assoc_use
+
+# Optional thresholds (start permissive; tighten later if plot too dense)
+rho_min  <- 0.25
+padj_max <- if("padj" %in% colnames(edges_raw)) 0.20 else Inf
+
+edges_filt <- edges_raw %>%
+  filter(Metabolite %in% top_metabolites_full) %>%
+  filter(is.finite(rho)) %>%
+  filter(abs(rho) >= rho_min) %>%
+  { if(is.finite(padj_max) && "padj" %in% colnames(.)) filter(., padj <= padj_max) else . } %>%
+  distinct(Genus, Metabolite, .keep_all = TRUE)
+
+cat("Edges kept:", nrow(edges_filt), "\n")
+cat("Metabolites in network:", dplyr::n_distinct(edges_filt$Metabolite), "\n")
+cat("Genera in network:", dplyr::n_distinct(edges_filt$Genus), "\n")
+# ============================================================ # STEP 9C1 — Diagnose why you got 0 edges # (almost always: thresholds too strict OR assoc_use is empty # OR Metabolite names don't match exactly) # ============================================================
+{r}
+library(dplyr)
+
+cat("assoc_use rows:", nrow(assoc_use), "\n")
+cat("assoc_use cols:", paste(colnames(assoc_use), collapse=", "), "\n")
+
+# sanity check required columns
+stopifnot(all(c("Genus","Metabolite","rho") %in% colnames(assoc_use)))
+
+# check overlap between your "top metabolite set" and assoc_use$Metabolite
+top_metabolites_full <- colnames(heat_mat)   # adjust to your actual heatmap matrix object
+cat("Top metabolites (heatmap):", length(top_metabolites_full), "\n")
+
+overlap_n <- sum(assoc_use$Metabolite %in% top_metabolites_full)
+cat("Overlap assoc_use vs heatmap metabolite names:", overlap_n, "\n")
+
+# Quick peek at name mismatches if overlap is 0
+if(overlap_n == 0) {
+  cat("\nExamples assoc_use metabolites:\n")
+  print(head(unique(assoc_use$Metabolite), 10))
+  cat("\nExamples heatmap metabolites:\n")
+  print(head(top_metabolites_full, 10))
+}
+
+# Look at rho distribution (to set a sensible cutoff)
+cat("\nrho summary:\n")
+print(summary(assoc_use$rho))
+cat("\nabs(rho) quantiles:\n")
+print(quantile(abs(assoc_use$rho), probs = c(.50,.75,.90,.95,.99), na.rm = TRUE))
+
+# If you have padj, inspect it too
+if("padj" %in% colnames(assoc_use)) {
+  cat("\npadj summary:\n")
+  print(summary(assoc_use$padj))
+  cat("\nN padj NA:", sum(is.na(assoc_use$padj)), "\n")
+}
+# ============================================================ # STEP 9D1 — Set realistic thresholds for n=23 # Your padj is basically all ~1 (min ~0.206), so a padj filter # will kill everything. For visualization/networking, use rho-only. # We'll keep the strongest correlations by abs(rho) quantile. # ============================================================ library(dplyr)
+{r}
+# choose a cutoff that actually yields edges
+# (90th percentile abs(rho) ~ 0.367; 95th ~ 0.432)
+rho_min <- 0.40   # good starting point for a readable network
+
+edges_filt <- assoc_use %>%
+  filter(is.finite(rho)) %>%
+  filter(abs(rho) >= rho_min)
+
+cat("rho_min:", rho_min, "\n")
+cat("Edges kept:", nrow(edges_filt), "\n")
+cat("Metabolites in network:", n_distinct(edges_filt$Metabolite), "\n")
+cat("Genera in network:", n_distinct(edges_filt$Genus), "\n")
+
+# If still 0, auto-relax to 90th percentile cutoff
+if(nrow(edges_filt) == 0) {
+  rho_min <- as.numeric(quantile(abs(assoc_use$rho), 0.90, na.rm = TRUE))
+  edges_filt <- assoc_use %>%
+    filter(is.finite(rho)) %>%
+    filter(abs(rho) >= rho_min)
+
+  cat("Auto rho_min (90th pct):", round(rho_min, 3), "\n")
+  cat("Edges kept:", nrow(edges_filt), "\n")
+  cat("Metabolites in network:", n_distinct(edges_filt$Metabolite), "\n")
+  cat("Genera in network:", n_distinct(edges_filt$Genus), "\n")
+}
+# ============================================================ # STEP 9D2 — Keep "full set of top metabolites" *but* control size # Option A: cap edges to top N by abs(rho) # (This is usually the best way to avoid hairballs.) # ============================================================
+{r}
+max_edges <- 500  # adjust: 200–800 typically reasonable
+
+edges_top <- edges_filt %>%
+  arrange(desc(abs(rho))) %>%
+  slice_head(n = max_edges)
+
+cat("Edges after cap:", nrow(edges_top), "\n")
+cat("Metabolites:", n_distinct(edges_top$Metabolite), "\n")
+cat("Genera:", n_distinct(edges_top$Genus), "\n")
+# ============================================================ # STEP 9D3 — Build igraph object + basic plot # Nodes are of two types: Genus vs Metabolite # Edge weight = rho (signed) # ============================================================
+{r}
+library(igraph)
+
+nodes_met <- tibble(name = unique(edges_top$Metabolite), type = "Metabolite")
+nodes_gen <- tibble(name = unique(edges_top$Genus),      type = "Genus")
+nodes <- bind_rows(nodes_met, nodes_gen)
+
+edges <- edges_top %>%
+  transmute(from = Metabolite,
+            to   = Genus,
+            weight = rho,
+            abs_weight = abs(rho),
+            sign = ifelse(rho >= 0, "pos", "neg"))
+
+g <- graph_from_data_frame(edges, directed = FALSE, vertices = nodes)
+
+cat("Graph summary:\n")
+print(g)
+cat("Node type counts:\n")
+print(table(V(g)$type))
+# ============================================================ # STEP 9D4 — Make it readable: prune isolated nodes + layout # (Optional) remove nodes with degree < 2 # ============================================================ # ============================================================ # STEP 9E3D — FIX: g is not a clean igraph (degree() failing) # Rebuild a "plain" igraph from an edge list, then prune by degree # ============================================================ # ============================================================ # STEP 9E3D (patch) — as_data_frame() is masked; use igraph:: # ============================================================
+{r}
+library(igraph)
+library(dplyr)
+
+cat("g class:", paste(class(g), collapse = ", "), "\n")
+
+# ---- 1) Get edge list safely (NO masking issues) ----
+ed <- igraph::as_data_frame(g, what = "edges")   # <- explicit igraph::
+# Alternative if you still hit issues:
+# ed <- as.data.frame(igraph::as_edgelist(g), stringsAsFactors = FALSE) %>%
+#   setNames(c("from","to"))
+
+cat("Edge table columns:\n")
+print(names(ed))
+stopifnot(all(c("from","to") %in% names(ed)))
+
+# ---- 2) Rebuild a clean igraph ----
+g_clean <- igraph::graph_from_data_frame(ed[, c("from","to")], directed = igraph::is_directed(g))
+
+# ---- 3) Carry over vertex type if present ----
+if ("type" %in% igraph::vertex_attr_names(g)) {
+  vt <- tibble(name = igraph::V(g)$name, type = as.character(igraph::V(g)$type))
+  igraph::V(g_clean)$type <- vt$type[match(igraph::V(g_clean)$name, vt$name)]
+}
+
+# ---- 4) Carry over / create weights ----
+if ("abs_weight" %in% names(ed)) {
+  igraph::E(g_clean)$abs_weight <- as.numeric(unlist(ed$abs_weight))
+} else if ("abs_rho" %in% names(ed)) {
+  igraph::E(g_clean)$abs_weight <- as.numeric(unlist(ed$abs_rho))
+} else if ("rho" %in% names(ed)) {
+  igraph::E(g_clean)$abs_weight <- abs(as.numeric(unlist(ed$rho)))
+} else {
+  igraph::E(g_clean)$abs_weight <- 1
+}
+
+w <- as.numeric(unlist(igraph::E(g_clean)$abs_weight))
+w[!is.finite(w)] <- NA_real_
+if (any(is.na(w))) w[is.na(w)] <- ifelse(all(is.na(w)), 1, median(w, na.rm = TRUE))
+igraph::E(g_clean)$abs_weight <- w
+
+# ---- 5) Degree prune (should no longer error) ----
+deg_min <- 2
+deg_vec <- igraph::degree(g_clean)
+g2 <- igraph::delete_vertices(g_clean, igraph::V(g_clean)[deg_vec < deg_min])
+
+cat("After degree prune:\n")
+print(g2)
+print(table(igraph::V(g2)$type))
+
+# ---- 6) Plot ----
+set.seed(1)
+lay <- igraph::layout_with_fr(g2, weights = igraph::E(g2)$abs_weight)
+
+w2 <- igraph::E(g2)$abs_weight
+wmin <- min(w2); wmax <- max(w2)
+edge_w <- if (isTRUE(all.equal(wmin, wmax))) rep(2, length(w2)) else 1 + 4*(w2 - wmin)/(wmax - wmin)
+
+plot(
+  g2,
+  layout = lay,
+  vertex.label.cex = 0.7,
+  vertex.size = ifelse(igraph::V(g2)$type == "Genus", 7, 5),
+  edge.width = edge_w
+)
+# ============================================================ # STEP 9E1A — FIX degree-prune error (force igraph + delete by index) # ============================================================
+{r}
+library(igraph)
+
+cat("Class of g:", paste(class(g), collapse = ", "), "\n")
+
+# If g is a tidygraph tbl_graph, convert to igraph
+g_ig <- if (inherits(g, "tbl_graph")) as.igraph(g) else g
+
+stopifnot(inherits(g_ig, "igraph"))
+
+deg_min <- 2
+
+# Always call igraph::degree explicitly
+deg_vec <- igraph::degree(g_ig)
+cat("degree() class:", paste(class(deg_vec), collapse=", "), "\n")
+
+# vertices to drop (numeric indices)
+drop_idx <- which(deg_vec < deg_min)
+
+cat("Vertices to drop:", length(drop_idx), "\n")
+
+# delete safely
+g_ig <- igraph::delete_vertices(g_ig, drop_idx)
+
+cat("After degree prune:", igraph::vcount(g_ig), "nodes,", igraph::ecount(g_ig), "edges\n")
+
+# overwrite g so downstream code works
+g <- g_ig
+# ============================================================ # STEP 9E2 — Choose which nodes get labels (top by degree or strength) # Only label top K genera + top K metabolites by degree # ============================================================
+{r}
+label_top_each <- 15  # try 10–20
+
+deg_df <- tibble(
+  name = V(g)$name,
+  type = V(g)$type,
+  degree = degree(g)
+)
+
+top_gen <- deg_df %>%
+  filter(type == "Genus") %>%
+  arrange(desc(degree)) %>%
+  slice_head(n = label_top_each) %>%
+  pull(name)
+
+top_met <- deg_df %>%
+  filter(type == "Metabolite") %>%
+  arrange(desc(degree)) %>%
+  slice_head(n = label_top_each) %>%
+  pull(name)
+
+V(g)$label <- ifelse(V(g)$name %in% c(top_gen, top_met), V(g)$name, "")
+table(V(g)$type, V(g)$label != "")
+# ============================================================ # STEP 9E3 — Clean network plot with ggraph (repelled labels) # ============================================================
+{r}
+library(ggraph)
+library(tidygraph)
+library(ggplot2)
+library(ggrepel)
+
+tg <- as_tbl_graph(g)
+
+set.seed(1)
+p_net <- ggraph(tg, layout = "fr") +
+  geom_edge_link(aes(width = abs_rho, linetype = sign), alpha = 0.35) +
+  geom_node_point(aes(shape = type), size = 2.2, alpha = 0.9) +
+  geom_node_text(aes(label = label), repel = TRUE, size = 3, max.overlaps = Inf) +
+  scale_edge_width(range = c(0.2, 2.5)) +
+  theme_void() +
+  theme(legend.position = "right")
+
+p_net
+# ============================================================ # STEP 9E3 (styled v2) — Colors + linetypes # Genus = green # Metabolite = orange # Positive rho = red dashed # Negative rho = blue solid # ============================================================ # ============================================================ # STEP 9E3 (fix) — edge-specific color/linetype scales # Genus = green # Metabolite = orange # Positive rho = red dashed # Negative rho = blue solid # ============================================================ # ============================================================ # STEP 9E3 (fix) — edge-specific color/linetype scales # Genus = green # Metabolite = orange # Positive rho = red dashed # Negative rho = blue solid # ============================================================
+{r}
+library(ggraph)
+library(tidygraph)
+library(ggplot2)
+library(ggrepel)
+
+tg <- as_tbl_graph(g)
+
+set.seed(1)
+p_net <- ggraph(tg, layout = "fr") +
+
+  # ---- Edges ----
+  geom_edge_link(
+    aes(
+      edge_width    = abs_rho,
+      edge_colour   = sign,
+      edge_linetype = sign
+    ),
+    alpha = 0.35
+  ) +
+
+  # ---- Nodes ----
+  geom_node_point(
+    aes(
+      color = type,
+      shape = type
+    ),
+    size = 2.4,
+    alpha = 0.9
+  ) +
+
+  # ---- Labels ----
+  geom_node_text(
+    aes(label = label),
+    repel = TRUE,
+    size = 3,
+    max.overlaps = Inf
+  ) +
+
+  # ---- Edge scales (THIS is the key fix) ----
+  scale_edge_colour_manual(
+    values = c(
+      "pos" = "#D73027",  # red
+      "neg" = "#4575B4"   # blue
+    )
+  ) +
+  scale_edge_linetype_manual(
+    values = c(
+      "pos" = "dashed",
+      "neg" = "solid"
+    )
+  ) +
+  scale_edge_width(range = c(0.2, 2.5)) +
+
+  # ---- Node scales ----
+  scale_color_manual(
+    values = c(
+      "Genus"      = "#2E7D32",  # green
+      "Metabolite" = "#F57C00"   # orange
+    )
+  ) +
+
+  theme_void() +
+  theme(legend.position = "right")
+
+p_net
+{r}
+
+library(ggraph)
+library(tidygraph)
+library(ggplot2)
+library(ggrepel)
+
+tg <- as_tbl_graph(g)
+
+set.seed(1)
+p_net <- ggraph(tg, layout = "fr") +
+
+  # ---- Edges ----
+  geom_edge_link(
+    aes(
+      edge_width    = abs_rho,
+      edge_colour   = sign,
+      edge_linetype = sign
+    ),
+    alpha = 0.35
+  ) +
+
+  # ---- Nodes (POINTS) ----
+  geom_node_point(
+    aes(shape = type, color = type),
+    size = 2.2,
+    alpha = 0.9
+  ) +
+
+  # ---- Labels ----
+  geom_node_text(
+    aes(label = label),
+    repel = TRUE,
+    size = 3,
+    max.overlaps = Inf,
+    force = 5,
+    force_pull = 0.5,
+    box.padding = 0.6,
+    point.padding = 0.4,
+    segment.alpha = 0.4
+  ) +
+
+  # ---- Edge scales ----
+  scale_edge_colour_manual(values = c("pos" = "#D73027", "neg" = "#4575B4")) +
+  scale_edge_linetype_manual(values = c("pos" = "dashed", "neg" = "solid")) +
+  scale_edge_width(range = c(0.2, 2.5)) +
+
+  # ---- Node scales ----
+  scale_shape_manual(values = c("Genus" = 16, "Metabolite" = 17)) +
+  scale_color_manual(values = c("Genus" = "#2E7D32", "Metabolite" = "#F57C00")) +
+
+  theme_void() +
+  theme(legend.position = "right")
+
+p_net
+{r}
+library(ggraph)
+library(tidygraph)
+library(ggplot2)
+library(ggrepel)
+
+tg <- as_tbl_graph(g)
+
+set.seed(1)
+p_net <- ggraph(tg, layout = "fr") +
+
+  geom_edge_link(
+    aes(edge_width = abs_rho, edge_colour = sign, edge_linetype = sign),
+    alpha = 0.35
+  ) +
+
+  geom_node_point(
+    aes(shape = type, color = type),
+    size = 2.2,
+    alpha = 0.9
+  ) +
+
+  geom_node_text(
+    aes(label = label),
+    repel = TRUE,
+    size = 3,
+    max.overlaps = Inf,
+    force = 15,
+    force_pull = 1,
+    box.padding = 0.9,
+    point.padding = 0.7,
+    min.segment.length = 0,
+    segment.alpha = 0.35
+  ) +
+
+  scale_edge_colour_manual(values = c("pos" = "#D73027", "neg" = "#4575B4")) +
+  scale_edge_linetype_manual(values = c("pos" = "dashed", "neg" = "solid")) +
+  scale_edge_width(range = c(0.2, 2.5)) +
+  scale_shape_manual(values = c("Genus" = 16, "Metabolite" = 17)) +
+  scale_color_manual(values = c("Genus" = "#2E7D32", "Metabolite" = "#F57C00")) +
+  theme_void() +
+  theme(legend.position = "right")
+
+p_net
+Isolating Akkermansia, Lachnospiraceae, Staphylococcus
+{r}
+library(ggraph)
+library(tidygraph)
+library(igraph)
+library(ggplot2)
+library(ggrepel)
+
+tg <- as_tbl_graph(g)
+ig <- as.igraph(tg)
+
+# ---- genera you want to isolate ----
+target_genera <- c("Akkermansia", "Lachnospiraceae", "Staphylococcus")
+
+# ---- identify target genera nodes by *name* ----
+target_idx <- which(
+  V(ig)$type == "Genus" &
+  V(ig)$name %in% target_genera
+)
+
+cat("Target genus nodes found:", length(target_idx), "\n")
+
+# ---- 1-hop neighborhood: targets + neighbors ----
+nbr_idx <- unique(c(
+  target_idx,
+  unlist(neighborhood(ig, order = 1, nodes = target_idx))
+))
+
+# ---- mark nodes to label ----
+tg <- tg %>%
+  activate(nodes) %>%
+  mutate(label_me = row_number() %in% nbr_idx)
+
+set.seed(1)
+p_net <- ggraph(tg, layout = "fr") +
+
+  # ---- Edges ----
+  geom_edge_link(
+    aes(edge_width = abs_rho, edge_colour = sign, edge_linetype = sign),
+    alpha = 0.35
+  ) +
+
+  # ---- Nodes ----
+  geom_node_point(
+    aes(shape = type, color = type),
+    size = 2.2,
+    alpha = 0.9
+  ) +
+
+  # ---- Labels (targets + 1-hop neighbors ONLY) ----
+  geom_node_text(
+    aes(label = ifelse(label_me, name, "")),
+    repel = TRUE,
+    size = 3,
+    max.overlaps = Inf,
+    force = 15,
+    force_pull = 1,
+    box.padding = 0.8,
+    point.padding = 0.6,
+    min.segment.length = 0,
+    segment.alpha = 0.4
+  ) +
+
+  # ---- Edge scales ----
+  scale_edge_colour_manual(values = c("pos" = "#D73027", "neg" = "#4575B4")) +
+  scale_edge_linetype_manual(values = c("pos" = "dashed", "neg" = "solid")) +
+  scale_edge_width(range = c(0.2, 2.5)) +
+
+  # ---- Node scales ----
+  scale_shape_manual(values = c("Genus" = 16, "Metabolite" = 17)) +
+  scale_color_manual(values = c("Genus" = "#2E7D32", "Metabolite" = "#F57C00")) +
+
+  theme_void() +
+  theme(legend.position = "right")
+
+p_net
+{r}
+library(tidygraph)
+library(igraph)
+library(dplyr)
+
+tg <- as_tbl_graph(g)
+ig <- as.igraph(tg)
+
+cat("Vertex attributes:\n")
+print(vertex_attr_names(ig))
+
+cat("\nFirst 10 node names:\n")
+print(head(V(ig)$name, 10))
+
+cat("\nFirst 10 node labels (if present):\n")
+print(head(V(ig)$label, 10))
+
+cat("\nType counts:\n")
+print(table(V(ig)$type, useNA="ifany"))
+
+# show genus nodes (what strings do we actually have?)
+genus_nodes <- tibble(
+  name  = V(ig)$name,
+  label = if("label" %in% vertex_attr_names(ig)) V(ig)$label else NA_character_,
+  type  = V(ig)$type
+) %>% filter(type == "Genus")
+
+cat("\nExample Genus node strings (first 30):\n")
+print(head(genus_nodes, 30))
+{r}
+library(ggraph)
+library(tidygraph)
+library(igraph)
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+
+tg <- as_tbl_graph(g)
+ig <- as.igraph(tg)
+
+# ---- DEBUG: what are the genus names actually called? ----
+cat("Example Genus node names:\n")
+print(head(V(ig)$name[V(ig)$type == "Genus"], 30))
+{r}
+# ============================================================
+# STEP 9E3C — FIX: your genus names have leading spaces
+# (trim whitespace before matching)
+# ============================================================
+
+library(ggraph)
+library(tidygraph)
+library(igraph)
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+library(stringr)
+
+tg <- as_tbl_graph(g)
+ig <- as.igraph(tg)
+
+# ---- choose genera to label (NO leading spaces here) ----
+target_genera <- c("Lachnospiraceae UCG-006", "Akkermansia", "Staphylococcus", "Lactobacillus")
+
+# ---- create trimmed versions of vertex fields for matching ----
+vtype <- V(ig)$type
+vname_trim <- str_trim(V(ig)$name)
+vlabel_trim <- ifelse(is.na(V(ig)$label), "", str_trim(V(ig)$label))
+
+# ---- find target genus vertices (match against trimmed name OR trimmed label) ----
+target_idx <- which(
+  vtype == "Genus" &
+    (vname_trim %in% target_genera | vlabel_trim %in% target_genera)
+)
+
+cat("Targets found:", length(target_idx), "\n")
+if (length(target_idx) == 0) {
+  cat("No targets found. Here are genus names that contain your keywords:\n")
+  print(sort(unique(vname_trim[vtype == "Genus" & grepl("Akkermansia|Lactobacillus|Staphylococcus|Lachnospiraceae", vname_trim)])))
+  stop("Targets not found — see printed genus names above and update target_genera accordingly.")
+}
+
+# ---- neighborhood: targets + 1-hop neighbors ----
+nbr_idx <- unique(c(
+  target_idx,
+  unlist(igraph::neighborhood(ig, order = 1, nodes = target_idx))
+))
+
+# ---- mark nodes to label + define display label ----
+tg <- tg %>%
+  activate(nodes) %>%
+  mutate(
+    name_trim  = str_trim(.data$name),
+    label_trim = ifelse(is.na(.data$label), "", str_trim(.data$label)),
+    disp = ifelse(label_trim != "", label_trim, name_trim),
+    label_me = row_number() %in% nbr_idx
+  )
+
+cat("Nodes to label (targets + neighbors):", sum(tg %>% activate(nodes) %>% pull(label_me)), "\n")
+
+set.seed(1)
+p_net <- ggraph(tg, layout = "fr") +
+
+  # ---- Edges ----
+  geom_edge_link(
+    aes(edge_width = abs_rho, edge_colour = sign, edge_linetype = sign),
+    alpha = 0.35
+  ) +
+
+  # ---- Nodes ----
+  geom_node_point(
+    aes(shape = type, color = type),
+    size = 2.2,
+    alpha = 0.9
+  ) +
+
+  # ---- Labels: ONLY targets + neighbors ----
+  ggrepel::geom_text_repel(
+    data = function(x) dplyr::filter(x, label_me),
+    aes(x = x, y = y, label = disp),
+    size = 3,
+    max.overlaps = Inf,
+    force = 25,
+    box.padding = 0.9,
+    point.padding = 0.7,
+    min.segment.length = 0,
+    segment.alpha = 0.4
+  ) +
+
+  # ---- Edge scales ----
+  scale_edge_colour_manual(values = c("pos" = "#D73027", "neg" = "#4575B4")) +
+  scale_edge_linetype_manual(values = c("pos" = "dashed", "neg" = "solid")) +
+  scale_edge_width(range = c(0.2, 2.5)) +
+
+  # ---- Node scales ----
+  scale_shape_manual(values = c("Genus" = 16, "Metabolite" = 17)) +
+  scale_color_manual(values = c("Genus" = "#2E7D32", "Metabolite" = "#F57C00")) +
+
+  theme_void() +
+  theme(legend.position = "right")
+
+p_net
+
+out_dir <- file.path(knitr_root, "integration_outputs", "network")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Save network plot
+ggsave(
+  filename = file.path(out_dir, "network_plot.png"),
+  plot = p_net,
+  width = 12, height = 8, dpi = 300
+)
+Same as above code, edited for png optimization
+{r}
+# ============================================================
+# STEP 9E3C — FIX: your genus names have leading spaces
+# (trim whitespace before matching)
+# ============================================================
+
+library(ggraph)
+library(tidygraph)
+library(igraph)
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+library(stringr)
+
+tg <- as_tbl_graph(g)
+ig <- as.igraph(tg)
+
+# ---- choose genera to label (NO leading spaces here) ----
+target_genera <- c("Lachnospiraceae UCG-006", "Akkermansia", "Staphylococcus", "Lactobacillus")
+
+# ---- create trimmed versions of vertex fields for matching ----
+vtype <- V(ig)$type
+vname_trim <- str_trim(V(ig)$name)
+vlabel_trim <- ifelse(is.na(V(ig)$label), "", str_trim(V(ig)$label))
+
+# ---- find target genus vertices (match against trimmed name OR trimmed label) ----
+target_idx <- which(
+  vtype == "Genus" &
+    (vname_trim %in% target_genera | vlabel_trim %in% target_genera)
+)
+
+cat("Targets found:", length(target_idx), "\n")
+if (length(target_idx) == 0) {
+  cat("No targets found. Here are genus names that contain your keywords:\n")
+  print(sort(unique(vname_trim[vtype == "Genus" & grepl("Akkermansia|Lactobacillus|Staphylococcus|Lachnospiraceae", vname_trim)])))
+  stop("Targets not found — see printed genus names above and update target_genera accordingly.")
+}
+
+# ---- neighborhood: targets + 1-hop neighbors ----
+nbr_idx <- unique(c(
+  target_idx,
+  unlist(igraph::neighborhood(ig, order = 1, nodes = target_idx))
+))
+
+# ---- mark nodes to label + define display label ----
+tg <- tg %>%
+  activate(nodes) %>%
+  mutate(
+    name_trim  = str_trim(.data$name),
+    label_trim = ifelse(is.na(.data$label), "", str_trim(.data$label)),
+    disp = ifelse(label_trim != "", label_trim, name_trim),
+    label_me = row_number() %in% nbr_idx
+  )
+
+cat("Nodes to label (targets + neighbors):", sum(tg %>% activate(nodes) %>% pull(label_me)), "\n")
+
+set.seed(1)
+p_net <- ggraph(tg, layout = "fr") +
+
+  # ---- Edges ----
+  geom_edge_link(
+    aes(edge_width = abs_rho, edge_colour = sign, edge_linetype = sign),
+    alpha = 0.35
+  ) +
+
+    # ---- Nodes (bigger) ----
+  geom_node_point(
+    aes(shape = type, color = type),
+    size = 3.8,        # ⬅️ was 2.2
+    alpha = 0.9
+  ) +
+
+  # ---- Labels (bigger) ----
+  ggrepel::geom_text_repel(
+    data = function(x) dplyr::filter(x, label_me),
+    aes(x = x, y = y, label = disp),
+    size = 4.8,        # ⬅️ was 3
+    max.overlaps = Inf,
+    force = 25,
+    box.padding = 1.1,
+    point.padding = 0.9,
+    min.segment.length = 0,
+    segment.alpha = 0.4
+  ) +
+
+  # ---- Edge scales ----
+  scale_edge_colour_manual(values = c("pos" = "#D73027", "neg" = "#4575B4")) +
+  scale_edge_linetype_manual(values = c("pos" = "dashed", "neg" = "solid")) +
+  scale_edge_width(range = c(0.2, 2.5)) +
+
+  # ---- Node scales ----
+  scale_shape_manual(values = c("Genus" = 16, "Metabolite" = 17)) +
+  scale_color_manual(values = c("Genus" = "#2E7D32", "Metabolite" = "#F57C00")) +
+
+  theme_void() +
+  theme(legend.position = "right")
+
+p_net
+
+out_dir <- file.path(knitr_root, "integration_outputs", "network")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Save network plot
+ggsave(
+  filename = file.path(out_dir, "network_plot_test.png"),
+  plot = p_net,
+  width = 14,    # ⬅️ was 12
+  height = 10,   # ⬅️ was 8
+  dpi = 300
+)
+# ============================================================ # STEP 9E3D — Restrict network to selected genera + their 1-hop neighbors # (keeps ONLY those genera and any metabolites directly connected to them) # ============================================================
+{r}
+library(ggraph)
+library(tidygraph)
+library(igraph)
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+library(stringr)
+
+tg0 <- as_tbl_graph(g)
+ig0 <- as.igraph(tg0)
+
+# ---- genera to keep (use EXACT names you saw, incl. bracketed Eubacterium groups) ----
+target_genera <- c(
+  "Akkermansia",
+  "Lactobacillus",
+  "Turicibacter",
+  "Butyricicoccus",
+  "Staphylococcus",
+  "Clostridium sensu stricto 1",
+  "Romboutsia",
+  " [Eubacterium] xylanophilum group",
+  " [Eubacterium] oxidoreducens group"
+)
+
+# ---- trim helper vectors for matching ----
+vtype       <- V(ig0)$type
+vname_trim  <- str_trim(V(ig0)$name)
+vlabel_trim <- ifelse(is.na(V(ig0)$label), "", str_trim(V(ig0)$label))
+
+target_idx <- which(
+  vtype == "Genus" &
+    (vname_trim %in% target_genera | vlabel_trim %in% target_genera)
+)
+
+cat("Targets found:", length(target_idx), "\n")
+if (length(target_idx) == 0) {
+  cat("No targets found. Available genus names matching keywords:\n")
+  print(sort(unique(vname_trim[vtype == "Genus" & grepl("Akkermansia|Lactobacillus|Turicibacter|Butyricicoccus|Staphylococcus|Clostridium|Eubacterium|Romboutsia", vname_trim)])))
+  stop("Targets not found — copy/paste exact genus names from the list above into target_genera.")
+}
+
+# ---- neighborhood: targets + 1-hop neighbors ----
+nbr_idx <- unique(c(
+  target_idx,
+  unlist(igraph::neighborhood(ig0, order = 1, nodes = target_idx))
+))
+
+# ---- Induce subgraph containing ONLY targets + their neighbors ----
+ig_sub <- igraph::induced_subgraph(ig0, vids = nbr_idx)
+
+# convert back to tbl_graph for ggraph
+tg <- tidygraph::as_tbl_graph(ig_sub)
+
+# ---- label only the target genera + their 1-hop neighbors (same as whole subgraph) ----
+tg <- tg %>%
+  activate(nodes) %>%
+  mutate(
+    name_trim  = str_trim(.data$name),
+    label_trim = ifelse(is.na(.data$label), "", str_trim(.data$label)),
+    disp = ifelse(label_trim != "", label_trim, name_trim),
+    is_target = (.data$type == "Genus") & (name_trim %in% target_genera | label_trim %in% target_genera),
+    label_me  = TRUE  # label everything in this restricted view (change to is_target if you only want genera labeled)
+  )
+
+cat("Nodes in restricted network:", tg %>% activate(nodes) %>% nrow(), "\n")
+cat("Edges in restricted network:", tg %>% activate(edges) %>% nrow(), "\n")
+
+set.seed(1)
+p_net <- ggraph(tg, layout = "fr") +
+
+  # ---- Edges ----
+  geom_edge_link(
+    aes(edge_width = abs_rho, edge_colour = sign, edge_linetype = sign),
+    alpha = 0.35
+  ) +
+
+  # ---- Nodes (bigger) ----
+  geom_node_point(
+    aes(shape = type, color = type),
+    size = 3.8,
+    alpha = 0.9
+  ) +
+
+  # ---- Labels (bigger) ----
+  ggrepel::geom_text_repel(
+    data = function(x) dplyr::filter(x, label_me),
+    aes(x = x, y = y, label = disp),
+    size = 4.8,
+    max.overlaps = Inf,
+    force = 25,
+    box.padding = 1.1,
+    point.padding = 0.9,
+    min.segment.length = 0,
+    segment.alpha = 0.4
+  ) +
+
+  # ---- Edge scales ----
+  scale_edge_colour_manual(values = c("pos" = "#D73027", "neg" = "#4575B4")) +
+  scale_edge_linetype_manual(values = c("pos" = "dashed", "neg" = "solid")) +
+  scale_edge_width(range = c(0.2, 2.5)) +
+
+  # ---- Node scales ----
+  scale_shape_manual(values = c("Genus" = 16, "Metabolite" = 17)) +
+  scale_color_manual(values = c("Genus" = "#2E7D32", "Metabolite" = "#F57C00")) +
+
+  theme_void() +
+  theme(legend.position = "right")
+
+p_net
+
+# ---- Save outputs to knitr root ----
+knitr_root <- knitr::opts_knit$get("root.dir")
+if (is.null(knitr_root) || is.na(knitr_root) || knitr_root == "") knitr_root <- getwd()
+
+out_dir <- file.path(knitr_root, "integration_outputs", "network")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+ggsave(
+  filename = file.path(out_dir, "network_plot_restricted_selected_genera_1hop.png"),
+  plot = p_net,
+  width = 14,
+  height = 10,
+  dpi = 300
+)
+
+# ---- Optional: also save the restricted nodes/edges tables ----
+nodes_df <- tg %>% activate(nodes) %>% as_tibble()
+edges_df <- tg %>% activate(edges) %>% as_tibble()
+
+write.csv(nodes_df, file.path(out_dir, "network_nodes_restricted_selected_genera_1hop.csv"), row.names = FALSE)
+write.csv(edges_df, file.path(out_dir, "network_edges_restricted_selected_genera_1hop.csv"), row.names = FALSE)
+# ============================================================ # STEP 9E3E — Keep FULL network map, but label ONLY selected genera + their 1-hop neighbors # (no subsetting of nodes/edges; just selective labeling + optional fading) # ============================================================ # ============================================================ # STEP 9E3E — FIX: edge_alpha must be length = n_edges # Keep FULL map, label ONLY selected genera + their 1-hop neighbors # ============================================================
+{r}
+library(ggraph)
+library(tidygraph)
+library(igraph)
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+library(stringr)
+
+tg <- as_tbl_graph(g)
+ig <- as.igraph(tg)
+
+target_genera <- c(
+  "Akkermansia",
+  "Lactobacillus",
+  "Turicibacter",
+  "Butyricicoccus",
+  "Staphylococcus",
+  "Clostridium sensu stricto 1",
+  "Romboutsia",
+  " [Eubacterium] xylanophilum group",
+  " [Eubacterium] oxidoreducens group"
+)
+
+# ---- trimmed helper vectors for matching ----
+# ---- create trimmed versions of vertex fields for matching ----
+vtype <- V(ig)$type
+vname_trim <- str_trim(V(ig)$name)
+vlabel_trim <- ifelse(is.na(V(ig)$label), "", str_trim(V(ig)$label))
+
+# ---- find target genus vertices (match against trimmed name OR trimmed label) ----
+target_idx <- which(
+  vtype == "Genus" &
+    (vname_trim %in% target_genera | vlabel_trim %in% target_genera)
+)
+
+
+cat("Targets found:", length(target_idx), "\n")
+if (length(target_idx) == 0) {
+  cat("No targets found. Here are genus names matching keywords:\n")
+  print(sort(unique(vname_trim[vtype == "Genus" & grepl("Akkermansia|Lactobacillus|Turicibacter|Butyricicoccus|Staphylococcus|Clostridium|Eubacterium|Romboutsia", vname_trim)])))
+  stop("Targets not found — copy/paste exact genus names from the list above into target_genera.")
+}
+# ---- neighborhood: targets + 1-hop neighbors ----
+nbr_idx <- unique(c(
+  target_idx,
+  unlist(igraph::neighborhood(ig, order = 1, nodes = target_idx))
+))
+
+# ---- mark nodes to label + define display label ----
+tg <- tg %>%
+  activate(nodes) %>%
+  mutate(
+    name_trim  = str_trim(.data$name),
+    label_trim = ifelse(is.na(.data$label), "", str_trim(.data$label)),
+    disp = ifelse(label_trim != "", label_trim, name_trim),
+    label_me = row_number() %in% nbr_idx
+  )
+
+cat("Nodes to label (targets + neighbors):", sum(tg %>% activate(nodes) %>% pull(label_me)), "\n")
+
+set.seed(1)
+p_net <- ggraph(tg, layout = "fr") +
+
+  # ---- Edges ----
+  geom_edge_link(
+    aes(edge_width = abs_rho, edge_colour = sign, edge_linetype = sign),
+    alpha = 0.35
+  ) +
+
+    # ---- Nodes (bigger) ----
+  geom_node_point(
+    aes(shape = type, color = type),
+    size = 3.8,        # ⬅️ was 2.2
+    alpha = 0.9
+  ) +
+
+  # ---- Labels (bigger) ----
+  ggrepel::geom_text_repel(
+    data = function(x) dplyr::filter(x, label_me),
+    aes(x = x, y = y, label = disp),
+    size = 4.8,        # ⬅️ was 3
+    max.overlaps = Inf,
+    force = 25,
+    box.padding = 1.1,
+    point.padding = 0.9,
+    min.segment.length = 0,
+    segment.alpha = 0.4
+  ) +
+
+  # ---- Edge scales ----
+  scale_edge_colour_manual(values = c("pos" = "#D73027", "neg" = "#4575B4")) +
+  scale_edge_linetype_manual(values = c("pos" = "dashed", "neg" = "solid")) +
+  scale_edge_width(range = c(0.2, 2.5)) +
+
+  # ---- Node scales ----
+  scale_shape_manual(values = c("Genus" = 16, "Metabolite" = 17)) +
+  scale_color_manual(values = c("Genus" = "#2E7D32", "Metabolite" = "#F57C00")) +
+
+  theme_void() +
+  theme(legend.position = "right")
+
+p_net
+
+out_dir <- file.path(knitr_root, "integration_outputs", "network")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Save network plot
+ggsave(
+  filename = file.path(out_dir, "network_plot_test_5genera.png"),
+  plot = p_net,
+  width = 18,    # ⬅️ was 12
+  height = 10,   # ⬅️ was 8
+  dpi = 300
+)
+```
+
+
+
+
+# ============================================================
+# STEP 2 — Build a Genus-level CLR table for integration
+# Requires: ps_pre from Step 1
+# Output: genus_clr (samples x genera), meta_pre (aligned)
+# ============================================================
+
+```{r}
+
+library(phyloseq)
+library(dplyr)
+library(tibble)
+library(microbiome)
+
+# 2A) Agglomerate to Genus
+ps_genus <- tax_glom(ps_pre, taxrank = "Genus")
+ps_genus <- prune_taxa(taxa_sums(ps_genus) > 0, ps_genus)
+
+# 2B) Extract count matrix as samples x genera
+genus_mat <- as(otu_table(ps_genus), "matrix")
+if (taxa_are_rows(ps_genus)) genus_mat <- t(genus_mat)
+
+# 2C) Clean genus names (use taxonomy to label columns)
+genus_tax <- as.data.frame(tax_table(ps_genus)) %>%
+  rownames_to_column("FeatureID")
+
+genus_names <- as.character(genus_tax$Genus)
+genus_names[is.na(genus_names) | genus_names == "" |
+              tolower(genus_names) %in% c("none","unclassified","unknown")] <- "Unclassified"
+
+colnames(genus_mat) <- make.unique(genus_names)
+
+# 2D) Prevalence filter (keeps genera present in >= 15% of mice)
+prev <- colMeans(genus_mat > 0)
+keep_genera <- names(prev[prev >= 0.15])
+
+genus_mat_f <- genus_mat[, keep_genera, drop = FALSE]
+
+cat("Genus features (before filter):", ncol(genus_mat), "\n")
+cat("Genus features (after filter): ", ncol(genus_mat_f), "\n")
+
+# 2E) CLR transform (adds pseudocount internally)
+# microbiome::transform expects taxa/features as columns and samples as rows (we have that)
+genus_clr <- microbiome::transform(genus_mat_f, "clr")
+genus_clr <- as.matrix(genus_clr)
+
+# 2F) Align metadata ordering to the CLR matrix
+meta_pre2 <- meta_pre %>%
+  filter(SampleID %in% rownames(genus_clr)) %>%
+  arrange(match(SampleID, rownames(genus_clr)))
+
+stopifnot(identical(meta_pre2$SampleID, rownames(genus_clr)))
+
+# Save aligned metadata back (optional)
+meta_pre <- meta_pre2
+
+# Peek
+cat("CLR matrix dim (samples x genera): ", paste(dim(genus_clr), collapse=" x "), "\n")
+head(genus_clr[, 1:min(6, ncol(genus_clr))])
+```
+
+
+
+# ============================================================
+# STEP 3 — Load untargeted metabolomics and align to 16S
+# Requires: genus_clr, meta_pre
+# Output: metab_mat (samples x features), shared_ids
+# ============================================================
+
+library(readr)
+library(dplyr)
+library(tibble)
+
+# ---- metabolomics file path (Windows-safe) ----
+metab_file <- "D:/OneDrive - Emory/Research/LCMS/Gacasan_Mouse_Stool_Antipsychotics_JW_12282025/hilicpos/Merge/Annotated_Metaboanalyst_Post.csv"
+
+# Load metabolomics table
+metab_raw <- read_csv(metab_file)
+
+cat("Raw metabolomics table dimensions:", dim(metab_raw), "\n")
+cat("First few column names:\n")
+print(colnames(metab_raw)[1:6])
+
+# Expect: first column = SampleID, remaining columns = numeric features
+metab_mat <- metab_raw %>%
+  rename(SampleID = 1) %>%
+  mutate(SampleID = as.character(SampleID)) %>%
+  column_to_rownames("SampleID") %>%
+  as.matrix()
+
+# -------------------------------
+# Sample alignment diagnostics
+# -------------------------------
+samples_16S <- rownames(genus_clr)
+samples_met <- rownames(metab_mat)
+
+missing_in_metab <- setdiff(samples_16S, samples_met)
+missing_in_16S   <- setdiff(samples_met, samples_16S)
+
+cat("\nSamples present in 16S but missing in metabolomics:\n")
+print(missing_in_metab)
+
+cat("\nSamples present in metabolomics but missing in 16S:\n")
+print(missing_in_16S)
+
+# -------------------------------
+# Restrict to shared samples ONLY
+# -------------------------------
+shared_ids <- intersect(samples_16S, samples_met)
+
+cat("\nSample counts:\n")
+cat("  16S total:", length(samples_16S), "\n")
+cat("  Metabolomics total:", length(samples_met), "\n")
+cat("  Used for integration:", length(shared_ids), "\n")
+
+# Subset all objects
+genus_clr <- genus_clr[shared_ids, , drop = FALSE]
+metab_mat <- metab_mat[shared_ids, , drop = FALSE]
+meta_pre  <- meta_pre %>%
+  filter(SampleID %in% shared_ids) %>%
+  arrange(match(SampleID, shared_ids))
+
+# Final alignment check (MUST be TRUE)
+stopifnot(
+  identical(rownames(genus_clr), rownames(metab_mat)),
+  identical(rownames(genus_clr), meta_pre$SampleID)
+)
+
+cat("\nFinal aligned dimensions:\n")
+cat("  genus_clr:", paste(dim(genus_clr), collapse = " x "), "\n")
+cat("  metab_mat:", paste(dim(metab_mat), collapse = " x "), "\n")
+
+
+#==============================================================================================================================
+This version uses FeatureID/ASV IDs for selection, then collapses those matched features into a single genus-level abundance per sample. It also saves:
+
+a long per-sample CSV
+
+a wide sample-by-feature CSV
+
+a summary stats CSV
+
+the plot files
+
+```{r}
+
+```
+
+
+
+
+```{r}
+library(phyloseq)
+library(tidyverse)
+library(tibble)
+library(stringr)
+library(ggplot2)
+library(rstatix)
+library(ggpubr)
+
+# ==========================================
+# USER INPUT
+# ==========================================
+genus_of_interest <- "Butyricicoccus"   # can also use "lacto"
+last_time_point   <- "T6"              # change if needed
+out_dir <- "Genus_FinalTimepoint_Comparisons"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+genus_safe <- gsub("[^A-Za-z0-9_]+", "_", genus_of_interest)
+tp_safe    <- gsub("[^A-Za-z0-9_]+", "_", last_time_point)
+
+plot_dir <- file.path(out_dir, paste0("Genus_", genus_safe, "_", tp_safe))
+dir.create(plot_dir, showWarnings = FALSE, recursive = TRUE)
+
+# optional: set treatment order if you want consistency
+treatment_order <- c("Vehicle", "Haloperidol", "Quetiapine", "Olanzapine", "Risperidone")
+
+# ==========================================
+# 1. Taxonomy table and FeatureID matching
+# ==========================================
+tax_df <- as.data.frame(tax_table(ps)) %>%
+  rownames_to_column("FeatureID")
+
+tax_df$Genus <- as.character(tax_df$Genus)
+tax_df$Genus[is.na(tax_df$Genus) |
+               tax_df$Genus == "" |
+               tolower(tax_df$Genus) %in% c("none", "unclassified", "unknown")] <- "Unclassified"
+
+matched_taxa <- tax_df %>%
+  filter(str_detect(tolower(Genus), tolower(genus_of_interest)))
+
+if (nrow(matched_taxa) == 0) {
+  cat("No matching genus found.\n\nAvailable genus names:\n")
+  print(sort(unique(tax_df$Genus)))
+  stop(paste("Genus not found:", genus_of_interest))
+}
+
+feature_ids <- matched_taxa$FeatureID
+
+cat("Matched genus labels:\n")
+print(unique(matched_taxa$Genus))
+cat("\nNumber of matched FeatureIDs:", length(feature_ids), "\n")
+
+write.csv(
+  matched_taxa,
+  file = file.path(plot_dir, paste0("Matched_FeatureIDs_", genus_safe, ".csv")),
+  row.names = FALSE
+)
+
+# ==========================================
+# 2. Subset to matched features and final time point
+# ==========================================
+ps_sub <- prune_taxa(feature_ids, ps)
+ps_sub <- subset_samples(ps_sub, Time_Point == last_time_point)
+ps_sub <- prune_taxa(taxa_sums(ps_sub) > 0, ps_sub)
+
+if (nsamples(ps_sub) == 0) {
+  stop(paste("No samples found at time point:", last_time_point))
+}
+if (ntaxa(ps_sub) == 0) {
+  stop("No matched taxa remained after subsetting.")
+}
+
+# ==========================================
+# 3. Extract raw abundance matrix
+#    (collapsed later across matched FeatureIDs)
+# ==========================================
+otu_mat <- as(otu_table(ps_sub), "matrix")
+if (taxa_are_rows(ps_sub)) {
+  otu_mat <- t(otu_mat)
+}
+
+otu_df <- as.data.frame(otu_mat) %>%
+  rownames_to_column("SampleID")
+
+meta_df <- data.frame(sample_data(ps_sub), stringsAsFactors = FALSE) %>%
+  rownames_to_column("SampleID")
+
+# ==========================================
+# 4. LONG feature-level table
+# ==========================================
+long_feature_df <- otu_df %>%
+  pivot_longer(
+    cols = -SampleID,
+    names_to = "FeatureID",
+    values_to = "Abundance"
+  ) %>%
+  left_join(
+    matched_taxa %>% select(any_of(c("FeatureID","Kingdom","Phylum","Class","Order","Family","Genus","Species"))),
+    by = "FeatureID"
+  ) %>%
+  left_join(meta_df, by = "SampleID")
+
+write.csv(
+  long_feature_df,
+  file = file.path(plot_dir, paste0("Genus_", genus_safe, "_", tp_safe, "_LONG_feature_level.csv")),
+  row.names = FALSE
+)
+
+# ==========================================
+# 5. WIDE sample x FeatureID table
+# ==========================================
+wide_feature_df <- otu_df %>%
+  left_join(meta_df, by = "SampleID")
+
+write.csv(
+  wide_feature_df,
+  file = file.path(plot_dir, paste0("Genus_", genus_safe, "_", tp_safe, "_WIDE_feature_level.csv")),
+  row.names = FALSE
+)
+
+# ==========================================
+# 6. Collapse matched FeatureIDs to one value per sample
+# ==========================================
+sample_genus_df <- long_feature_df %>%
+  group_by(SampleID) %>%
+  summarise(
+    Abundance = sum(Abundance, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(meta_df, by = "SampleID") %>%
+  mutate(
+    GenusQuery = genus_of_interest,
+    Time_Point = last_time_point
+  )
+
+if ("TreatmentGroup" %in% colnames(sample_genus_df)) {
+  sample_genus_df$TreatmentGroup <- factor(
+    sample_genus_df$TreatmentGroup,
+    levels = intersect(treatment_order, unique(sample_genus_df$TreatmentGroup))
+  )
+}
+
+sample_genus_df %>%
+  group_by(TreatmentGroup) %>%
+  summarise(
+    n = n(),
+    non_missing = sum(!is.na(Abundance)),
+    unique_vals = n_distinct(Abundance, na.rm = TRUE),
+    all_zero = all(Abundance == 0, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write.csv(
+  sample_genus_df,
+  file = file.path(plot_dir, paste0("Genus_", genus_safe, "_", tp_safe, "_LONG_collapsed_samples.csv")),
+  row.names = FALSE
+)
+
+# ==========================================
+# 7. Summary stats by treatment group
+# ==========================================
+summary_df <- sample_genus_df %>%
+  group_by(TreatmentGroup) %>%
+  summarise(
+    n = sum(!is.na(Abundance)),
+    mean_abund = mean(Abundance, na.rm = TRUE),
+    median_abund = median(Abundance, na.rm = TRUE),
+    sd_abund = sd(Abundance, na.rm = TRUE),
+    se_abund = sd_abund / sqrt(n),
+    .groups = "drop"
+  )
+
+write.csv(
+  summary_df,
+  file = file.path(plot_dir, paste0("Genus_", genus_safe, "_", tp_safe, "_summary_stats.csv")),
+  row.names = FALSE
+)
+
+# ==========================================
+# 8. Overall + pairwise stats
+#    Kruskal-Wallis + pairwise Wilcoxon
+# ==========================================
+# ==========================================
+# 8. Overall + pairwise stats
+#    Kruskal-Wallis + robust pairwise Wilcoxon
+# ==========================================
+
+# clean table first
+stats_df <- sample_genus_df %>%
+  dplyr::select(SampleID, TreatmentGroup, Abundance) %>%
+  filter(!is.na(TreatmentGroup), !is.na(Abundance)) %>%
+  mutate(TreatmentGroup = droplevels(factor(TreatmentGroup)))
+
+# optional diagnostic
+group_check <- stats_df %>%
+  group_by(TreatmentGroup) %>%
+  summarise(
+    n = n(),
+    n_unique = n_distinct(Abundance),
+    min_abund = min(Abundance, na.rm = TRUE),
+    max_abund = max(Abundance, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(group_check)
+
+# Kruskal-Wallis
+kw_res <- stats_df %>%
+  kruskal_test(Abundance ~ TreatmentGroup)
+
+# robust pairwise Wilcoxon
+valid_groups <- stats_df %>%
+  group_by(TreatmentGroup) %>%
+  summarise(
+    n = n(),
+    n_unique = n_distinct(Abundance),
+    .groups = "drop"
+  ) %>%
+  filter(n >= 2) %>%
+  pull(TreatmentGroup) %>%
+  as.character()
+
+pairwise_df <- stats_df %>%
+  filter(TreatmentGroup %in% valid_groups) %>%
+  mutate(TreatmentGroup = droplevels(factor(TreatmentGroup)))
+
+group_pairs <- combn(unique(as.character(pairwise_df$TreatmentGroup)), 2, simplify = FALSE)
+
+pairwise_list <- lapply(group_pairs, function(g) {
+  sub <- pairwise_df %>%
+    filter(TreatmentGroup %in% g)
+
+  x <- sub$Abundance[sub$TreatmentGroup == g[1]]
+  y <- sub$Abundance[sub$TreatmentGroup == g[2]]
+
+  x <- x[!is.na(x)]
+  y <- y[!is.na(y)]
+
+  # skip broken comparisons
+  if (length(x) < 1 || length(y) < 1) {
+    return(NULL)
+  }
+
+  # wilcox can still behave oddly in degenerate cases, so wrap safely
+  wt <- tryCatch(
+    wilcox.test(x, y, exact = FALSE),
+    error = function(e) NULL
+  )
+
+  if (is.null(wt)) {
+    return(NULL)
+  }
+
+  tibble(
+    group1 = g[1],
+    group2 = g[2],
+    p = wt$p.value
+  )
+})
+
+pairwise_res <- bind_rows(pairwise_list)
+
+if (nrow(pairwise_res) > 0) {
+  pairwise_res <- pairwise_res %>%
+    mutate(
+      p.adj = p.adjust(p, method = "BH"),
+      p.adj.signif = case_when(
+        p.adj <= 0.0001 ~ "****",
+        p.adj <= 0.001  ~ "***",
+        p.adj <= 0.01   ~ "**",
+        p.adj <= 0.05   ~ "*",
+        TRUE            ~ "ns"
+      )
+    )
+} else {
+  pairwise_res <- tibble(
+    group1 = character(),
+    group2 = character(),
+    p = numeric(),
+    p.adj = numeric(),
+    p.adj.signif = character()
+  )
+}
+
+write.csv(
+  kw_res,
+  file = file.path(plot_dir, paste0("Genus_", genus_safe, "_", tp_safe, "_kruskal_wallis.csv")),
+  row.names = FALSE
+)
+
+write.csv(
+  pairwise_res,
+  file = file.path(plot_dir, paste0("Genus_", genus_safe, "_", tp_safe, "_pairwise_wilcox.csv")),
+  row.names = FALSE
+)
+# ==========================================
+# 9. Plot
+# ==========================================
+y_max <- max(stats_df$Abundance, na.rm = TRUE)
+
+sig_pairs <- pairwise_res %>%
+  filter(p.adj < 0.05) %>%
+  arrange(p.adj)
+
+if (nrow(sig_pairs) > 0) {
+  sig_pairs <- sig_pairs %>%
+    mutate(
+      y.position = y_max * (1.05 + 0.08 * row_number()),
+      label = paste0("BH p = ", signif(p.adj, 2))
+    )
+}
+
+p <- ggplot(stats_df, aes(x = TreatmentGroup, y = Abundance, fill = TreatmentGroup)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.65, width = 0.7) +
+  geom_jitter(width = 0.15, size = 2, alpha = 0.8) +
+  labs(
+    title = paste0(genus_of_interest, " abundance at ", last_time_point),
+    subtitle = paste0("Collapsed from ", length(feature_ids), " matched FeatureIDs"),
+    x = "Treatment Group",
+    y = "Abundance"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5),
+    legend.position = "none"
+  )
+
+if (nrow(sig_pairs) > 0) {
+  p <- p + stat_pvalue_manual(
+    sig_pairs,
+    label = "label",
+    xmin = "group1",
+    xmax = "group2",
+    y.position = "y.position",
+    tip.length = 0.01,
+    bracket.size = 0.3,
+    size = 3
+  )
+}
+
+print(p)
+
+ggsave(
+  file.path(plot_dir, paste0("Genus_", genus_safe, "_", tp_safe, "_boxplot.pdf")),
+  p, width = 8, height = 6
+)
+
+ggsave(
+  file.path(plot_dir, paste0("Genus_", genus_safe, "_", tp_safe, "_boxplot.tiff")),
+  p, width = 8, height = 6, dpi = 300
+)
+```
+
+```{r}
+# ============================================================
+# DIABLO pipeline: T6, genus-level 16S + annotated metabolites
+# Built for:
+#   ps = phyloseq object
+#   annotated metabolite file with:
+#     row 1 = sample names
+#     row 2 = group labels
+#     row 3+ = metabolite intensities
+# Output:
+#   tuned DIABLO model + plots + exports
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(phyloseq)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(stringr)
+  library(purrr)
+  library(microbiome)
+  library(mixOmics)
+  library(ggplot2)
+  library(readr)
+  library(BiocParallel)
+})
+
+# -----------------------------
+# 0. settings
+# -----------------------------
+pre_tp <- "T6"
+out_dir <- file.path(root.dir, "DIABLO_T6_AnnotatedOnly")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+set.seed(123)
+
+# microbiome filtering
+genus_prevalence_cutoff <- 0.15
+genus_variance_quantile <- 0.10
+
+# metabolite filtering
+met_missing_prop_max <- 0.20
+met_variance_quantile <- 0.10
+
+# DIABLO tuning grid
+ncomp_test <- 2
+test_keepX_microbe <- c(5, 10, 15, 20, 30)
+test_keepX_metab   <- c(5, 10, 15, 20, 30)
+
+# treatment order
+treatment_levels <- c("Vehicle", "Haloperidol", "Quetiapine", "Olanzapine", "Risperidone")
+
+# -----------------------------
+# helper: sample ID cleaning
+# -----------------------------
+clean_id <- function(x) {
+  x %>%
+    as.character() %>%
+    str_replace("\\.mzXML$", "") %>%
+    str_replace("\\.mzML$", "") %>%
+    str_replace("_01$", "") %>%
+    str_trim()
+}
+
+# ============================================================
+# 1. subset phyloseq to T6
+# ============================================================
+ps_t6 <- subset_samples(ps, Time_Point == pre_tp)
+ps_t6 <- prune_taxa(taxa_sums(ps_t6) > 0, ps_t6)
+
+meta_16s <- data.frame(sample_data(ps_t6), stringsAsFactors = FALSE) %>%
+  rownames_to_column("SampleID") %>%
+  mutate(
+    SampleID = clean_id(SampleID),
+    TreatmentGroup = as.character(TreatmentGroup),
+    Time_Point = as.character(Time_Point)
+  )
+
+cat("T6 16S samples:", nrow(meta_16s), "\n")
+print(table(meta_16s$TreatmentGroup))
+
+# ============================================================
+# 2. build genus-level CLR matrix
+# ============================================================
+ps_genus <- tax_glom(ps_t6, taxrank = "Genus")
+ps_genus <- prune_taxa(taxa_sums(ps_genus) > 0, ps_genus)
+
+genus_mat <- as(otu_table(ps_genus), "matrix")
+if (taxa_are_rows(ps_genus)) genus_mat <- t(genus_mat)
+
+# enforce sample IDs
+rownames(genus_mat) <- clean_id(rownames(genus_mat))
+
+genus_tax <- as.data.frame(tax_table(ps_genus)) %>%
+  rownames_to_column("FeatureID")
+
+genus_names <- as.character(genus_tax$Genus)
+genus_names[is.na(genus_names) | genus_names == "" |
+              tolower(genus_names) %in% c("none", "unclassified", "unknown")] <- "Unclassified"
+colnames(genus_mat) <- make.unique(genus_names)
+
+# prevalence filter
+genus_prev <- colMeans(genus_mat > 0, na.rm = TRUE)
+keep_genera_prev <- names(genus_prev[genus_prev >= genus_prevalence_cutoff])
+genus_mat_f <- genus_mat[, keep_genera_prev, drop = FALSE]
+
+# preserve sample IDs through CLR
+genus_sample_ids <- rownames(genus_mat_f)
+
+genus_clr <- microbiome::transform(genus_mat_f, "clr")
+genus_clr <- as.matrix(genus_clr)
+rownames(genus_clr) <- genus_sample_ids
+
+# low-variance filter
+genus_var <- apply(genus_clr, 2, var, na.rm = TRUE)
+genus_keep_var <- genus_var > quantile(genus_var, genus_variance_quantile, na.rm = TRUE)
+genus_clr <- genus_clr[, genus_keep_var, drop = FALSE]
+
+# remove any residual bad columns
+genus_clr <- genus_clr[, apply(genus_clr, 2, function(x) all(is.finite(x))), drop = FALSE]
+genus_clr <- genus_clr[, apply(genus_clr, 2, var, na.rm = TRUE) > 0, drop = FALSE]
+
+cat("Genus CLR matrix:", dim(genus_clr)[1], "samples x", dim(genus_clr)[2], "genera\n")
+cat("Example 16S IDs:\n")
+print(head(rownames(genus_clr), 10))
+
+# ============================================================
+# 3. prepare annotated metabolite matrix
+# ============================================================
+met_file <- "D:/OneDrive - Emory/Research/LCMS/Gacasan_Mouse_Stool_Antipsychotics_JW_12282025/hilicpos/Merge/Annotated_Metaboanalyst_Post.csv"
+
+met_raw <- read.csv(
+  met_file,
+  header = TRUE,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+cat("Raw metabolite table dimensions:", dim(met_raw), "\n")
+stopifnot(colnames(met_raw)[1] == "Name")
+
+# -----------------------------
+# 3A. extract group row
+# -----------------------------
+group_row <- met_raw[1, , drop = FALSE]
+
+sample_cols_met <- colnames(met_raw)[-1]
+sample_group_labels <- as.character(group_row[1, -1])
+
+group_key <- tibble(
+  RawSample = sample_cols_met,
+  RawGroup  = sample_group_labels
+)
+
+# -----------------------------
+# 3B. remove group row, keep metabolite data
+# -----------------------------
+met_tbl <- met_raw[-1, , drop = FALSE]
+met_tbl$Name <- make.unique(as.character(met_tbl$Name))
+
+# -----------------------------
+# 3C. matrix of metabolites x samples
+# -----------------------------
+met_mat <- met_tbl %>%
+  dplyr::select(Name, all_of(sample_cols_met))
+
+rownames(met_mat) <- met_mat$Name
+met_mat <- met_mat[, -1, drop = FALSE]
+met_mat <- as.matrix(met_mat)
+mode(met_mat) <- "numeric"
+
+# transpose to samples x metabolites
+met_mat_num <- t(met_mat)
+rownames(met_mat_num) <- clean_id(rownames(met_mat_num))
+
+cat("Metabolite matrix after transpose:", dim(met_mat_num)[1], "samples x", dim(met_mat_num)[2], "metabolites\n")
+cat("Example metabolomics IDs:\n")
+print(head(rownames(met_mat_num), 10))
+
+# -----------------------------
+# 3D. metabolomics sample key
+# -----------------------------
+group_key <- group_key %>%
+  mutate(
+    SampleID = clean_id(RawSample),
+    TreatmentGroup = case_when(
+      str_starts(RawGroup, "H_") ~ "Haloperidol",
+      str_starts(RawGroup, "O_") ~ "Olanzapine",
+      str_starts(RawGroup, "Q_") ~ "Quetiapine",
+      str_starts(RawGroup, "R_") ~ "Risperidone",
+      str_starts(RawGroup, "V_") ~ "Vehicle",
+      TRUE ~ RawGroup
+    ),
+    Time_Point = pre_tp
+  )
+
+write.csv(group_key, file.path(out_dir, "metabolite_sample_key.csv"), row.names = FALSE)
+
+# -----------------------------
+# 3E. metabolite QC/filtering
+# -----------------------------
+met_missing_prop <- colMeans(is.na(met_mat_num))
+met_mat_f <- met_mat_num[, met_missing_prop <= met_missing_prop_max, drop = FALSE]
+
+# half-min imputation per metabolite
+for (j in seq_len(ncol(met_mat_f))) {
+  x <- met_mat_f[, j]
+  if (anyNA(x)) {
+    nonmiss <- x[!is.na(x) & x > 0]
+    fill_val <- if (length(nonmiss) > 0) min(nonmiss) / 2 else 1e-6
+    x[is.na(x)] <- fill_val
+    met_mat_f[, j] <- x
+  }
+}
+
+# log2 transform
+met_log <- log2(met_mat_f + 1)
+
+# low variance filter
+met_var <- apply(met_log, 2, var, na.rm = TRUE)
+met_keep_var <- met_var > quantile(met_var, met_variance_quantile, na.rm = TRUE)
+met_log <- met_log[, met_keep_var, drop = FALSE]
+
+# preserve dimnames through scale
+met_sample_ids <- rownames(met_log)
+met_feature_ids <- colnames(met_log)
+
+met_scaled <- scale(met_log)
+met_scaled <- as.matrix(met_scaled)
+rownames(met_scaled) <- met_sample_ids
+colnames(met_scaled) <- met_feature_ids
+
+# remove bad columns
+met_scaled <- met_scaled[, apply(met_scaled, 2, function(x) all(is.finite(x))), drop = FALSE]
+met_scaled <- met_scaled[, apply(met_scaled, 2, var, na.rm = TRUE) > 0, drop = FALSE]
+
+cat("Filtered metabolite matrix:", dim(met_scaled)[1], "samples x", dim(met_scaled)[2], "metabolites\n")
+
+write.csv(
+  data.frame(SampleID = rownames(met_scaled), met_scaled, check.names = FALSE),
+  file.path(out_dir, "metabolome_annotated_scaled_matrix.csv"),
+  row.names = FALSE
+)
+
+# ============================================================
+# 4. align shared samples at T6 using canonical IDs
+# ============================================================
+
+# -----------------------------
+# 4A. Build canonical ID for 16S
+# -----------------------------
+if (!("Mouse_Number" %in% colnames(meta_16s))) {
+  stop("meta_16s does not contain Mouse_Number.")
+}
+
+meta_16s_key <- meta_16s %>%
+  mutate(
+    TreatmentCode = case_when(
+      TreatmentGroup == "Haloperidol" ~ "H",
+      TreatmentGroup == "Olanzapine"  ~ "O",
+      TreatmentGroup == "Quetiapine"  ~ "Q",
+      TreatmentGroup == "Risperidone" ~ "R",
+      TreatmentGroup == "Vehicle"     ~ "V",
+      TRUE ~ NA_character_
+    ),
+    Mouse_Number = as.character(Mouse_Number),
+    CanonicalID = paste0(TreatmentCode, "_", Mouse_Number)
+  ) %>%
+  dplyr::select(
+    SampleID,
+    TreatmentGroup,
+    Time_Point,
+    Mouse_Number,
+    CanonicalID
+  )
+
+cat("16S canonical IDs:\n")
+print(meta_16s_key %>% dplyr::select(SampleID, CanonicalID) %>% head(10))
+
+# -----------------------------
+# 4B. Build canonical ID for metabolomics
+# Example: H_Post_1 -> H_1
+# -----------------------------
+meta_met_key <- group_key %>%
+  mutate(
+    Mouse_Number = str_extract(SampleID, "(?<=_)[0-9]+$"),
+    TreatmentCode = str_extract(SampleID, "^[A-Z]"),
+    CanonicalID = paste0(TreatmentCode, "_", Mouse_Number)
+  ) %>%
+  dplyr::select(
+    SampleID,
+    TreatmentGroup,
+    Time_Point,
+    Mouse_Number,
+    CanonicalID
+  )
+
+cat("Metabolomics canonical IDs:\n")
+print(meta_met_key %>% dplyr::select(SampleID, CanonicalID) %>% head(10))
+
+# -----------------------------
+# 4C. Attach canonical IDs to matrices
+# -----------------------------
+genus_rownames <- rownames(genus_clr)
+met_rownames   <- rownames(met_scaled)
+
+genus_map <- tibble(SampleID = genus_rownames) %>%
+  left_join(meta_16s_key, by = "SampleID")
+
+met_map <- tibble(SampleID = met_rownames) %>%
+  left_join(meta_met_key, by = "SampleID")
+
+# diagnostics
+cat("16S rows missing CanonicalID:", sum(is.na(genus_map$CanonicalID)), "\n")
+cat("Metabolomics rows missing CanonicalID:", sum(is.na(met_map$CanonicalID)), "\n")
+
+if (any(is.na(genus_map$CanonicalID))) {
+  cat("16S samples missing CanonicalID:\n")
+  print(genus_map %>% filter(is.na(CanonicalID)))
+}
+
+if (any(is.na(met_map$CanonicalID))) {
+  cat("Metabolomics samples missing CanonicalID:\n")
+  print(met_map %>% filter(is.na(CanonicalID)))
+}
+
+# -----------------------------
+# 4D. Find shared canonical IDs
+# -----------------------------
+common_ids <- intersect(
+  genus_map$CanonicalID,
+  met_map$CanonicalID
+)
+
+common_ids <- common_ids[!is.na(common_ids)]
+
+cat("Shared canonical IDs:", length(common_ids), "\n")
+print(common_ids)
+
+if (length(common_ids) < 5) {
+  stop("Too few shared samples found after canonical ID matching.")
+}
+
+# -----------------------------
+# 4E. Reorder matrices by shared canonical IDs
+# -----------------------------
+genus_keep <- genus_map %>%
+  filter(CanonicalID %in% common_ids) %>%
+  arrange(match(CanonicalID, common_ids))
+
+met_keep <- met_map %>%
+  filter(CanonicalID %in% common_ids) %>%
+  arrange(match(CanonicalID, common_ids))
+
+genus_clr_aligned <- genus_clr[genus_keep$SampleID, , drop = FALSE]
+met_scaled_aligned <- met_scaled[met_keep$SampleID, , drop = FALSE]
+
+# rename rownames to canonical IDs so both blocks match exactly
+rownames(genus_clr_aligned) <- genus_keep$CanonicalID
+rownames(met_scaled_aligned) <- met_keep$CanonicalID
+
+# -----------------------------
+# 4F. Build final metadata for DIABLO
+# -----------------------------
+meta_diablo <- genus_keep %>%
+  dplyr::select(
+    SampleID_16S = SampleID,
+    TreatmentGroup,
+    Time_Point,
+    Mouse_Number,
+    CanonicalID
+  ) %>%
+  left_join(
+    met_keep %>%
+      dplyr::select(
+        CanonicalID,
+        SampleID_Metabolomics = SampleID
+      ),
+    by = "CanonicalID"
+  ) %>%
+  mutate(
+    TreatmentGroup = factor(TreatmentGroup, levels = treatment_levels)
+  ) %>%
+  arrange(match(CanonicalID, common_ids))
+
+# final checks
+stopifnot(identical(meta_diablo$CanonicalID, rownames(genus_clr_aligned)))
+stopifnot(identical(meta_diablo$CanonicalID, rownames(met_scaled_aligned)))
+
+# overwrite the originals used downstream
+genus_clr  <- genus_clr_aligned
+met_scaled <- met_scaled_aligned
+
+write.csv(meta_diablo, file.path(out_dir, "DIABLO_metadata_used.csv"), row.names = FALSE)
+
+cat("Final aligned sample counts by treatment:\n")
+print(table(meta_diablo$TreatmentGroup))
+
+# ============================================================
+# 5. build DIABLO input blocks
+# ============================================================
+X <- list(
+  microbiome = genus_clr,
+  metabolome = met_scaled
+)
+
+Y <- meta_diablo$TreatmentGroup
+names(Y) <- meta_diablo$CanonicalID
+
+design <- matrix(c(
+  0,   0.1,
+  0.1, 0
+), nrow = 2, byrow = TRUE)
+colnames(design) <- rownames(design) <- names(X)
+
+print(design)
+
+# cap keepX at available features
+test_keepX_microbe_use <- test_keepX_microbe[test_keepX_microbe <= ncol(X$microbiome)]
+test_keepX_metab_use   <- test_keepX_metab[test_keepX_metab <= ncol(X$metabolome)]
+
+if (length(test_keepX_microbe_use) == 0) test_keepX_microbe_use <- min(5, ncol(X$microbiome))
+if (length(test_keepX_metab_use) == 0)   test_keepX_metab_use   <- min(5, ncol(X$metabolome))
+
+init_keep_microbe <- min(20, ncol(X$microbiome))
+init_keep_metab   <- min(20, ncol(X$metabolome))
+
+# ============================================================
+# 6. quick initial model
+# ============================================================
+diablo_init <- block.splsda(
+  X = X,
+  Y = Y,
+  ncomp = ncomp_test,
+  keepX = list(
+    microbiome = rep(init_keep_microbe, ncomp_test),
+    metabolome = rep(init_keep_metab, ncomp_test)
+  ),
+  design = design
+)
+
+saveRDS(diablo_init, file.path(out_dir, "diablo_initial_model.rds"))
+
+# ============================================================
+# 7. tune keepX
+# ============================================================
+tune_diablo <- tune.block.splsda(
+  X = X,
+  Y = Y,
+  ncomp = ncomp_test,
+  test.keepX = list(
+    microbiome = test_keepX_microbe_use,
+    metabolome = test_keepX_metab_use
+  ),
+  design = design,
+  validation = "Mfold",
+  folds = 5,
+  nrepeat = 20,
+  dist = "centroids.dist",
+  BPPARAM = BiocParallel::SerialParam()
+)
+
+saveRDS(tune_diablo, file.path(out_dir, "diablo_tuning_results.rds"))
+
+keepX_opt <- tune_diablo$choice.keepX
+print(keepX_opt)
+
+write.csv(
+  data.frame(
+    block = rep(names(keepX_opt), each = length(keepX_opt[[1]])),
+    component = rep(seq_along(keepX_opt[[1]]), times = length(keepX_opt)),
+    keepX = unlist(keepX_opt)
+  ),
+  file.path(out_dir, "diablo_optimal_keepX.csv"),
+  row.names = FALSE
+)
+
+# ============================================================
+# 8. fit tuned final model
+# ============================================================
+diablo_final <- block.splsda(
+  X = X,
+  Y = Y,
+  ncomp = ncomp_test,
+  keepX = keepX_opt,
+  design = design
+)
+
+saveRDS(diablo_final, file.path(out_dir, "diablo_final_model.rds"))
+
+# ============================================================
+# 9. performance assessment
+# ============================================================
+perf_diablo <- perf(
+  diablo_final,
+  validation = "Mfold",
+  folds = 5,
+  nrepeat = 20,
+  dist = "centroids.dist",
+  BPPARAM = BiocParallel::SerialParam()
+)
+
+saveRDS(perf_diablo, file.path(out_dir, "diablo_performance.rds"))
+```
+
+
+```{r}
+# ============================================================
+# 10. selected features export
+# ============================================================
+extract_selected_vars <- function(model, block, comp) {
+  sv <- selectVar(model, block = block, comp = comp)
+
+  # Case 1: preferred path using $name and $value
+  feats <- NULL
+  vals  <- NULL
+
+  if (!is.null(sv$name)) {
+    feats <- sv$name
+    if (is.list(feats)) feats <- feats[[comp]]
+  }
+
+  if (!is.null(sv$value)) {
+    vals <- sv$value
+    if (is.list(vals)) {
+      vals <- vals[[comp]]
+    } else if (is.matrix(vals) || is.data.frame(vals)) {
+      # if rows are features, use rownames + first numeric column
+      vals_df <- as.data.frame(vals, stringsAsFactors = FALSE)
+      if (nrow(vals_df) > 0) {
+        if (is.null(feats) || length(feats) == 0) {
+          feats <- rownames(vals_df)
+        }
+        vals <- suppressWarnings(as.numeric(vals_df[[1]]))
+      } else {
+        vals <- numeric(0)
+      }
+    } else {
+      vals <- suppressWarnings(as.numeric(vals))
+    }
+  }
+
+  # clean up empty results
+  if (is.null(feats) || length(feats) == 0) {
+    feats <- character(0)
+  }
+  if (is.null(vals) || length(vals) == 0) {
+    vals <- numeric(0)
+  }
+
+  # harmonize lengths
+  n <- min(length(feats), length(vals))
+
+  if (n == 0) {
+    return(data.frame(
+      Feature = character(0),
+      Loading = numeric(0),
+      block = character(0),
+      component = integer(0),
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  out <- data.frame(
+    Feature = as.character(feats[seq_len(n)]),
+    Loading = as.numeric(vals[seq_len(n)]),
+    block = rep(block, n),
+    component = rep(comp, n),
+    stringsAsFactors = FALSE
+  )
+
+  out
+}
+
+sel_microbe <- extract_selected_vars(diablo_final, block = "microbiome", comp = 1)
+sel_metab   <- extract_selected_vars(diablo_final, block = "metabolome", comp = 1)
+
+write.csv(sel_microbe, file.path(out_dir, "selected_microbiome_comp1.csv"), row.names = FALSE)
+write.csv(sel_metab,   file.path(out_dir, "selected_metabolome_comp1.csv"), row.names = FALSE)
+
+if (ncomp_test >= 2) {
+  sel_microbe_c2 <- extract_selected_vars(diablo_final, block = "microbiome", comp = 2)
+  sel_metab_c2   <- extract_selected_vars(diablo_final, block = "metabolome", comp = 2)
+
+  write.csv(sel_microbe_c2, file.path(out_dir, "selected_microbiome_comp2.csv"), row.names = FALSE)
+  write.csv(sel_metab_c2,   file.path(out_dir, "selected_metabolome_comp2.csv"), row.names = FALSE)
+}
+
+cat("Selected features exported.\n")
+cat("Comp1 microbiome:", nrow(sel_microbe), "features\n")
+cat("Comp1 metabolome:", nrow(sel_metab), "features\n")
+if (ncomp_test >= 2) {
+  cat("Comp2 microbiome:", nrow(sel_microbe_c2), "features\n")
+  cat("Comp2 metabolome:", nrow(sel_metab_c2), "features\n")
+}
+
+
+# ============================================================
+# 11. sample plots
+# ============================================================
+pdf(file.path(out_dir, "DIABLO_sample_plots.pdf"), width = 9, height = 7)
+
+plotIndiv(
+  diablo_final,
+  ind.names = FALSE,
+  legend = TRUE,
+  title = "DIABLO: sample separation by treatment",
+  ellipse = TRUE,
+  star = FALSE
+)
+
+plotIndiv(
+  diablo_final,
+  ind.names = FALSE,
+  legend = TRUE,
+  title = "DIABLO: consensus sample plot",
+  ellipse = TRUE,
+  style = "graphics",
+  study = "all.partial"
+)
+
+dev.off()
+
+# ============================================================
+# 12. variable plots / loadings
+# ============================================================
+pdf(file.path(out_dir, "DIABLO_variable_plots.pdf"), width = 10, height = 8)
+
+plotVar(
+  diablo_final,
+  comp = c(1, 2),
+  title = "DIABLO variable plot"
+)
+
+plotLoadings(
+  diablo_final,
+  block = "microbiome",
+  comp = 1,
+  method = "mean",
+  contrib = "max",
+  ndisplay = min(25, ncol(X$microbiome)),
+  title = "Microbiome loadings, comp 1"
+)
+
+plotLoadings(
+  diablo_final,
+  block = "metabolome",
+  comp = 1,
+  method = "mean",
+  contrib = "max",
+  ndisplay = min(25, ncol(X$metabolome)),
+  title = "Metabolome loadings, comp 1"
+)
+
+dev.off()
+
+# ============================================================
+# 13. clustered image map
+# ============================================================
+pdf(file.path(out_dir, "DIABLO_cim.pdf"), width = 12, height = 10)
+
+cimDiablo(
+  diablo_final,
+  comp = 1,
+  margins = c(8, 14)
+)
+
+dev.off()
+```
+
+```{r}
+# ============================================================
+# 14. circos + network
+# ============================================================
+pdf(file.path(out_dir, "DIABLO_circos_comp1_cutoff0.2.pdf"), width = 14, height = 14)
+circosPlot(
+  diablo_final,
+  comp = 1,
+  cutoff = 0.2,
+  line = TRUE,
+  size.variables = 0.9,
+  size.labels = 0.9
+)
+dev.off()
+
+pdf(file.path(out_dir, "DIABLO_network_comp1.pdf"), width = 12, height = 10)
+network(
+  diablo_final,
+  cutoff = 0.4,
+  blocks = c(1, 2),
+  color.node = c("goldenrod3", "steelblue4"),
+  shape.node = c("circle", "rectangle")
+)
+dev.off()
+
+```
+
+
+```{r}
+# ============================================================
+# 15. save block scores / sample coordinates
+# ============================================================
+scores_micro <- as.data.frame(diablo_final$variates$microbiome) %>%
+  rownames_to_column("CanonicalID") %>%
+  mutate(block = "microbiome")
+
+scores_metab <- as.data.frame(diablo_final$variates$metabolome) %>%
+  rownames_to_column("CanonicalID") %>%
+  mutate(block = "metabolome")
+
+scores_consensus <- as.data.frame(diablo_final$variates$X) %>%
+  rownames_to_column("CanonicalID") %>%
+  mutate(block = "consensus")
+
+scores_all <- bind_rows(scores_micro, scores_metab, scores_consensus) %>%
+  left_join(meta_diablo, by = "CanonicalID")
+
+write.csv(scores_all, file.path(out_dir, "DIABLO_sample_scores.csv"), row.names = FALSE)
+
+# ============================================================
+# 16. save processed input matrices
+# ============================================================
+write.csv(
+  data.frame(SampleID = rownames(genus_clr), genus_clr, check.names = FALSE),
+  file.path(out_dir, "microbiome_genus_CLR_matrix.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  data.frame(SampleID = rownames(met_scaled), met_scaled, check.names = FALSE),
+  file.path(out_dir, "metabolome_annotated_scaled_matrix.csv"),
+  row.names = FALSE
+)
+
+write.csv(meta_diablo, file.path(out_dir, "DIABLO_metadata_used.csv"), row.names = FALSE)
+
+cat("DIABLO pipeline complete. Outputs saved to:\n", out_dir, "\n")
+```
+
+```{r}
+# ============================================================
+# Volcano plots from precomputed stats tables
+# Creates:
+#   1) annotated volcano plots (top 10 labeled metabolites)
+#   2) unannotated volcano plots
+# For:
+#   Haloperidol, Olanzapine, Quetiapine, Risperidone, Vehicle
+#
+# Points are colored by drug group.
+# Significant points are highlighted, with standard threshold lines at:
+#   |log2FC| = 1
+#   p = 0.05
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(ggrepel)
+})
+
+# -----------------------------
+# Input/output directories
+# -----------------------------
+in_dir <- "D:/OneDrive - Emory/Research/LCMS/Gacasan_Mouse_Stool_Antipsychotics_JW_12282025/hilicpos/Merge/VolcanoPlots_PreVsPost"
+out_dir <- file.path(in_dir, "VolcanoPlots_Annotated_Unannotated")
+
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+# -----------------------------
+# Drug colors
+# -----------------------------
+drug_cols <- c(
+  Vehicle      = "#000000",
+  Risperidone  = "#B69D71",
+  Quetiapine   = "#E3DED4",
+  Olanzapine   = "#70AFC7",
+  Haloperidol  = "#4F5357"
+)
+
+# -----------------------------
+# Files
+# -----------------------------
+csv_files <- list.files(
+  in_dir,
+  pattern = "^volcano_stats_.*_PostVsPre\\.csv$",
+  full.names = TRUE
+)
+
+# -----------------------------
+# Helper functions
+# -----------------------------
+extract_group <- function(x) {
+  x |>
+    basename() |>
+    str_remove("^volcano_stats_") |>
+    str_remove("_PostVsPre\\.csv$")
+}
+
+# Heuristic for annotated metabolite names
+is_annotated_name <- function(x) {
+  x <- trimws(as.character(x))
+  !is.na(x) &
+    x != "" &
+    !x %in% c("NA", "na", "N/A", "Unknown", "unknown", "Unannotated", "unannotated") &
+    !str_detect(x, "^mz[_:.]") &
+    !str_detect(x, "^[0-9.]+_[0-9.]+$") &
+    !str_detect(x, "^[0-9.]+@[0-9.]+$") &
+    !str_detect(x, "^[Mm]/?[Zz]") &
+    !str_detect(x, "^[Xx][0-9]+$")
+}
+
+make_volcano_plot <- function(df, group_name, annotate = FALSE, n_label = 10) {
+
+  group_col <- drug_cols[[group_name]]
+  if (is.null(group_col)) group_col <- "black"
+
+  # Basic cleanup
+  df <- df %>%
+    mutate(
+      Name = as.character(Name),
+      mean_pre = as.numeric(mean_pre),
+      mean_post = as.numeric(mean_post),
+      log2FC = as.numeric(log2FC),
+      p_value = as.numeric(p_value),
+      fdr = as.numeric(fdr),
+      neglog10p = as.numeric(neglog10p),
+      neglog10fdr = as.numeric(neglog10fdr),
+      sig = as.character(sig)
+    ) %>%
+    filter(!is.na(log2FC), !is.na(neglog10p), !is.na(p_value)) %>%
+    mutate(
+      highlight = abs(log2FC) >= 1 & p_value < 0.05
+    )
+
+  # Top 10 annotated metabolites by smallest p-value, then largest |log2FC|
+  label_df <- df %>%
+    filter(is_annotated_name(Name)) %>%
+    arrange(p_value, desc(abs(log2FC))) %>%
+    slice_head(n = n_label)
+
+  p <- ggplot(df, aes(x = log2FC, y = neglog10p)) +
+    geom_hline(
+      yintercept = -log10(0.05),
+      linetype = "dashed",
+      linewidth = 0.5,
+      color = "grey40"
+    ) +
+    geom_vline(
+      xintercept = c(-1, 1),
+      linetype = "dashed",
+      linewidth = 0.5,
+      color = "grey40"
+    ) +
+    geom_point(
+      data = df %>% filter(!highlight),
+      color = group_col,
+      size = 2,
+      alpha = 0.45
+    ) +
+    geom_point(
+      data = df %>% filter(highlight),
+      color = group_col,
+      size = 2.6,
+      alpha = 1
+    ) +
+    labs(
+      title = paste0(group_name, " Post vs Pre"),
+      x = expression(log[2]~fold~change),
+      y = expression(-log[10]~italic(p))
+    ) +
+    theme_bw(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      panel.grid = element_blank()
+    )
+
+  if (annotate && nrow(label_df) > 0) {
+    p <- p +
+      ggrepel::geom_text_repel(
+        data = label_df,
+        aes(label = Name),
+        size = 3.2,
+        box.padding = 0.35,
+        point.padding = 0.2,
+        segment.size = 0.3,
+        max.overlaps = Inf,
+        min.segment.length = 0
+      )
+  }
+
+  p
+}
+
+# -----------------------------
+# Generate plots
+# -----------------------------
+for (f in csv_files) {
+
+  group_name <- extract_group(f)
+
+  df <- read.csv(f, stringsAsFactors = FALSE, check.names = FALSE)
+
+  p_unannotated <- make_volcano_plot(df, group_name, annotate = FALSE, n_label = 10)
+  p_annotated   <- make_volcano_plot(df, group_name, annotate = TRUE,  n_label = 10)
+
+  ggsave(
+    filename = file.path(out_dir, paste0("Volcano_", group_name, "_PostVsPre_unannotated.png")),
+    plot = p_unannotated,
+    width = 7,
+    height = 6,
+    dpi = 300
+  )
+  ggsave(
+    filename = file.path(out_dir, paste0("Volcano_", group_name, "_PostVsPre_unannotated.pdf")),
+    plot = p_unannotated,
+    width = 7,
+    height = 6
+  )
+
+  ggsave(
+    filename = file.path(out_dir, paste0("Volcano_", group_name, "_PostVsPre_annotated_top10.png")),
+    plot = p_annotated,
+    width = 8.5,
+    height = 7,
+    dpi = 300
+  )
+  ggsave(
+    filename = file.path(out_dir, paste0("Volcano_", group_name, "_PostVsPre_annotated_top10.pdf")),
+    plot = p_annotated,
+    width = 8.5,
+    height = 7
+  )
+}
+
+message("Done. Plots saved to: ", out_dir)
+print(list.files(out_dir))
+```
+
+
+
+
+
+
+
+```{r}
+# ============================================================
+# DIABLO pipeline: T6, genus-level 16S + annotated metabolites
+# Rewritten so circos feature summaries are shown as dodged bar plots
+# instead of outer radial lines above the circle
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(phyloseq)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(stringr)
+  library(purrr)
+  library(microbiome)
+  library(mixOmics)
+  library(ggplot2)
+  library(readr)
+  library(BiocParallel)
+  library(patchwork)
+})
+
+# -----------------------------
+# 0. settings
+# -----------------------------
+pre_tp <- "T6"
+out_dir <- file.path(root.dir, "DIABLO_T6_AnnotatedOnly_BarplotVersion")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+set.seed(123)
+
+# microbiome filtering
+genus_prevalence_cutoff <- 0.15
+genus_variance_quantile <- 0.10
+
+# metabolite filtering
+met_missing_prop_max <- 0.20
+met_variance_quantile <- 0.10
+
+# DIABLO tuning grid
+ncomp_test <- 2
+test_keepX_microbe <- c(5, 10, 15, 20, 30)
+test_keepX_metab   <- c(5, 10, 15, 20, 30)
+
+# treatment order
+treatment_levels <- c("Vehicle", "Haloperidol", "Quetiapine", "Olanzapine", "Risperidone")
+
+# treatment colors
+drug_cols <- c(
+  "Vehicle"      = "#000000",
+  "Risperidone"  = "#B69D71",
+  "Quetiapine"   = "#E3DED4",
+  "Olanzapine"   = "#70AFC7",
+  "Haloperidol"  = "#4F5357"
+)
+
+# number of selected features to show in bar plots
+top_n_barplot <- 15
+
+# -----------------------------
+# helper: sample ID cleaning
+# -----------------------------
+clean_id <- function(x) {
+  x %>%
+    as.character() %>%
+    str_replace("\\.mzXML$", "") %>%
+    str_replace("\\.mzML$", "") %>%
+    str_replace("_01$", "") %>%
+    str_trim()
+}
+
+# helper: mean ± SEM summary
+summarize_mean_sem <- function(df) {
+  df %>%
+    group_by(TreatmentGroup, Feature) %>%
+    summarise(
+      mean = mean(Value, na.rm = TRUE),
+      sem  = sd(Value, na.rm = TRUE) / sqrt(sum(!is.na(Value))),
+      .groups = "drop"
+    )
+}
+
+# ============================================================
+# 1. subset phyloseq to T6
+# ============================================================
+ps_t6 <- subset_samples(ps, Time_Point == pre_tp)
+ps_t6 <- prune_taxa(taxa_sums(ps_t6) > 0, ps_t6)
+
+meta_16s <- data.frame(sample_data(ps_t6), stringsAsFactors = FALSE) %>%
+  rownames_to_column("SampleID") %>%
+  mutate(
+    SampleID = clean_id(SampleID),
+    TreatmentGroup = as.character(TreatmentGroup),
+    Time_Point = as.character(Time_Point)
+  )
+
+cat("T6 16S samples:", nrow(meta_16s), "\n")
+print(table(meta_16s$TreatmentGroup))
+
+# ============================================================
+# 2. build genus-level CLR matrix
+# ============================================================
+ps_genus <- tax_glom(ps_t6, taxrank = "Genus")
+ps_genus <- prune_taxa(taxa_sums(ps_genus) > 0, ps_genus)
+
+genus_mat <- as(otu_table(ps_genus), "matrix")
+if (taxa_are_rows(ps_genus)) genus_mat <- t(genus_mat)
+
+rownames(genus_mat) <- clean_id(rownames(genus_mat))
+
+genus_tax <- as.data.frame(tax_table(ps_genus)) %>%
+  rownames_to_column("FeatureID")
+
+genus_names <- as.character(genus_tax$Genus)
+genus_names[is.na(genus_names) | genus_names == "" |
+              tolower(genus_names) %in% c("none", "unclassified", "unknown")] <- "Unclassified"
+colnames(genus_mat) <- make.unique(genus_names)
+
+# prevalence filter
+genus_prev <- colMeans(genus_mat > 0, na.rm = TRUE)
+keep_genera_prev <- names(genus_prev[genus_prev >= genus_prevalence_cutoff])
+genus_mat_f <- genus_mat[, keep_genera_prev, drop = FALSE]
+
+# preserve sample IDs through CLR
+genus_sample_ids <- rownames(genus_mat_f)
+
+genus_clr <- microbiome::transform(genus_mat_f, "clr")
+genus_clr <- as.matrix(genus_clr)
+rownames(genus_clr) <- genus_sample_ids
+
+# low variance filter
+genus_var <- apply(genus_clr, 2, var, na.rm = TRUE)
+genus_keep_var <- genus_var > quantile(genus_var, genus_variance_quantile, na.rm = TRUE)
+genus_clr <- genus_clr[, genus_keep_var, drop = FALSE]
+
+# remove bad columns
+genus_clr <- genus_clr[, apply(genus_clr, 2, function(x) all(is.finite(x))), drop = FALSE]
+genus_clr <- genus_clr[, apply(genus_clr, 2, var, na.rm = TRUE) > 0, drop = FALSE]
+
+cat("Genus CLR matrix:", dim(genus_clr)[1], "samples x", dim(genus_clr)[2], "genera\n")
+
+# ============================================================
+# 3. prepare annotated metabolite matrix
+# ============================================================
+met_file <- "D:/OneDrive - Emory/Research/LCMS/Gacasan_Mouse_Stool_Antipsychotics_JW_12282025/hilicpos/Merge/Annotated_Metaboanalyst_Post.csv"
+
+met_raw <- read.csv(
+  met_file,
+  header = TRUE,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+cat("Raw metabolite table dimensions:", dim(met_raw), "\n")
+stopifnot(colnames(met_raw)[1] == "Name")
+
+# -----------------------------
+# 3A. extract group row
+# -----------------------------
+group_row <- met_raw[1, , drop = FALSE]
+
+sample_cols_met <- colnames(met_raw)[-1]
+sample_group_labels <- as.character(group_row[1, -1])
+
+group_key <- tibble(
+  RawSample = sample_cols_met,
+  RawGroup  = sample_group_labels
+)
+
+# -----------------------------
+# 3B. remove group row
+# -----------------------------
+met_tbl <- met_raw[-1, , drop = FALSE]
+met_tbl$Name <- make.unique(as.character(met_tbl$Name))
+
+# -----------------------------
+# 3C. matrix of metabolites x samples
+# -----------------------------
+met_mat <- met_tbl %>%
+  dplyr::select(Name, all_of(sample_cols_met))
+
+rownames(met_mat) <- met_mat$Name
+met_mat <- met_mat[, -1, drop = FALSE]
+met_mat <- as.matrix(met_mat)
+mode(met_mat) <- "numeric"
+
+# transpose to samples x metabolites
+met_mat_num <- t(met_mat)
+rownames(met_mat_num) <- clean_id(rownames(met_mat_num))
+
+cat("Metabolite matrix after transpose:", dim(met_mat_num)[1], "samples x", dim(met_mat_num)[2], "metabolites\n")
+
+# -----------------------------
+# 3D. metabolomics sample key
+# -----------------------------
+group_key <- group_key %>%
+  mutate(
+    SampleID = clean_id(RawSample),
+    TreatmentGroup = case_when(
+      str_starts(RawGroup, "H_") ~ "Haloperidol",
+      str_starts(RawGroup, "O_") ~ "Olanzapine",
+      str_starts(RawGroup, "Q_") ~ "Quetiapine",
+      str_starts(RawGroup, "R_") ~ "Risperidone",
+      str_starts(RawGroup, "V_") ~ "Vehicle",
+      TRUE ~ RawGroup
+    ),
+    Time_Point = pre_tp
+  )
+
+write.csv(group_key, file.path(out_dir, "metabolite_sample_key.csv"), row.names = FALSE)
+
+# -----------------------------
+# 3E. metabolite QC/filtering
+# -----------------------------
+met_missing_prop <- colMeans(is.na(met_mat_num))
+met_mat_f <- met_mat_num[, met_missing_prop <= met_missing_prop_max, drop = FALSE]
+
+# half-min imputation per metabolite
+for (j in seq_len(ncol(met_mat_f))) {
+  x <- met_mat_f[, j]
+  if (anyNA(x)) {
+    nonmiss <- x[!is.na(x) & x > 0]
+    fill_val <- if (length(nonmiss) > 0) min(nonmiss) / 2 else 1e-6
+    x[is.na(x)] <- fill_val
+    met_mat_f[, j] <- x
+  }
+}
+
+# log2 transform
+met_log <- log2(met_mat_f + 1)
+
+# low variance filter
+met_var <- apply(met_log, 2, var, na.rm = TRUE)
+met_keep_var <- met_var > quantile(met_var, met_variance_quantile, na.rm = TRUE)
+met_log <- met_log[, met_keep_var, drop = FALSE]
+
+# preserve dimnames through scale
+met_sample_ids <- rownames(met_log)
+met_feature_ids <- colnames(met_log)
+
+met_scaled <- scale(met_log)
+met_scaled <- as.matrix(met_scaled)
+rownames(met_scaled) <- met_sample_ids
+colnames(met_scaled) <- met_feature_ids
+
+# remove bad columns
+met_scaled <- met_scaled[, apply(met_scaled, 2, function(x) all(is.finite(x))), drop = FALSE]
+met_scaled <- met_scaled[, apply(met_scaled, 2, var, na.rm = TRUE) > 0, drop = FALSE]
+
+cat("Filtered metabolite matrix:", dim(met_scaled)[1], "samples x", dim(met_scaled)[2], "metabolites\n")
+
+write.csv(
+  data.frame(SampleID = rownames(met_scaled), met_scaled, check.names = FALSE),
+  file.path(out_dir, "metabolome_annotated_scaled_matrix.csv"),
+  row.names = FALSE
+)
+
+# ============================================================
+# 4. align shared samples at T6 using canonical IDs
+# ============================================================
+if (!("Mouse_Number" %in% colnames(meta_16s))) {
+  stop("meta_16s does not contain Mouse_Number.")
+}
+
+# 16S key
+meta_16s_key <- meta_16s %>%
+  mutate(
+    TreatmentCode = case_when(
+      TreatmentGroup == "Haloperidol" ~ "H",
+      TreatmentGroup == "Olanzapine"  ~ "O",
+      TreatmentGroup == "Quetiapine"  ~ "Q",
+      TreatmentGroup == "Risperidone" ~ "R",
+      TreatmentGroup == "Vehicle"     ~ "V",
+      TRUE ~ NA_character_
+    ),
+    Mouse_Number = as.character(Mouse_Number),
+    CanonicalID = paste0(TreatmentCode, "_", Mouse_Number)
+  ) %>%
+  dplyr::select(
+    SampleID,
+    TreatmentGroup,
+    Time_Point,
+    Mouse_Number,
+    CanonicalID
+  )
+
+# metabolomics key
+meta_met_key <- group_key %>%
+  mutate(
+    Mouse_Number = str_extract(SampleID, "(?<=_)[0-9]+$"),
+    TreatmentCode = str_extract(SampleID, "^[A-Z]"),
+    CanonicalID = paste0(TreatmentCode, "_", Mouse_Number)
+  ) %>%
+  dplyr::select(
+    SampleID,
+    TreatmentGroup,
+    Time_Point,
+    Mouse_Number,
+    CanonicalID
+  )
+
+# attach canonical IDs
+genus_rownames <- rownames(genus_clr)
+met_rownames   <- rownames(met_scaled)
+
+genus_map <- tibble(SampleID = genus_rownames) %>%
+  left_join(meta_16s_key, by = "SampleID")
+
+met_map <- tibble(SampleID = met_rownames) %>%
+  left_join(meta_met_key, by = "SampleID")
+
+cat("16S rows missing CanonicalID:", sum(is.na(genus_map$CanonicalID)), "\n")
+cat("Metabolomics rows missing CanonicalID:", sum(is.na(met_map$CanonicalID)), "\n")
+
+# shared IDs
+common_ids <- intersect(genus_map$CanonicalID, met_map$CanonicalID)
+common_ids <- common_ids[!is.na(common_ids)]
+
+cat("Shared canonical IDs:", length(common_ids), "\n")
+print(common_ids)
+
+if (length(common_ids) < 5) {
+  stop("Too few shared samples found after canonical ID matching.")
+}
+
+# reorder matrices
+genus_keep <- genus_map %>%
+  filter(CanonicalID %in% common_ids) %>%
+  arrange(match(CanonicalID, common_ids))
+
+met_keep <- met_map %>%
+  filter(CanonicalID %in% common_ids) %>%
+  arrange(match(CanonicalID, common_ids))
+
+genus_clr_aligned <- genus_clr[genus_keep$SampleID, , drop = FALSE]
+met_scaled_aligned <- met_scaled[met_keep$SampleID, , drop = FALSE]
+
+rownames(genus_clr_aligned) <- genus_keep$CanonicalID
+rownames(met_scaled_aligned) <- met_keep$CanonicalID
+
+# final metadata
+meta_diablo <- genus_keep %>%
+  dplyr::select(
+    SampleID_16S = SampleID,
+    TreatmentGroup,
+    Time_Point,
+    Mouse_Number,
+    CanonicalID
+  ) %>%
+  left_join(
+    met_keep %>%
+      dplyr::select(
+        CanonicalID,
+        SampleID_Metabolomics = SampleID
+      ),
+    by = "CanonicalID"
+  ) %>%
+  mutate(
+    TreatmentGroup = factor(TreatmentGroup, levels = treatment_levels)
+  ) %>%
+  arrange(match(CanonicalID, common_ids))
+
+stopifnot(identical(meta_diablo$CanonicalID, rownames(genus_clr_aligned)))
+stopifnot(identical(meta_diablo$CanonicalID, rownames(met_scaled_aligned)))
+
+genus_clr  <- genus_clr_aligned
+met_scaled <- met_scaled_aligned
+
+write.csv(meta_diablo, file.path(out_dir, "DIABLO_metadata_used.csv"), row.names = FALSE)
+
+cat("Final aligned sample counts by treatment:\n")
+print(table(meta_diablo$TreatmentGroup))
+
+# ============================================================
+# 5. build DIABLO input blocks
+# ============================================================
+X <- list(
+  microbiome = genus_clr,
+  metabolome = met_scaled
+)
+
+Y <- meta_diablo$TreatmentGroup
+names(Y) <- meta_diablo$CanonicalID
+
+design <- matrix(c(
+  0,   0.1,
+  0.1, 0
+), nrow = 2, byrow = TRUE)
+colnames(design) <- rownames(design) <- names(X)
+
+print(design)
+
+# cap keepX at available features
+test_keepX_microbe_use <- test_keepX_microbe[test_keepX_microbe <= ncol(X$microbiome)]
+test_keepX_metab_use   <- test_keepX_metab[test_keepX_metab <= ncol(X$metabolome)]
+
+if (length(test_keepX_microbe_use) == 0) test_keepX_microbe_use <- min(5, ncol(X$microbiome))
+if (length(test_keepX_metab_use) == 0)   test_keepX_metab_use   <- min(5, ncol(X$metabolome))
+
+init_keep_microbe <- min(20, ncol(X$microbiome))
+init_keep_metab   <- min(20, ncol(X$metabolome))
+
+# ============================================================
+# 6. quick initial model
+# ============================================================
+diablo_init <- block.splsda(
+  X = X,
+  Y = Y,
+  ncomp = ncomp_test,
+  keepX = list(
+    microbiome = rep(init_keep_microbe, ncomp_test),
+    metabolome = rep(init_keep_metab, ncomp_test)
+  ),
+  design = design
+)
+
+saveRDS(diablo_init, file.path(out_dir, "diablo_initial_model.rds"))
+
+# ============================================================
+# 7. tune keepX
+# ============================================================
+tune_diablo <- tune.block.splsda(
+  X = X,
+  Y = Y,
+  ncomp = ncomp_test,
+  test.keepX = list(
+    microbiome = test_keepX_microbe_use,
+    metabolome = test_keepX_metab_use
+  ),
+  design = design,
+  validation = "Mfold",
+  folds = 5,
+  nrepeat = 20,
+  dist = "centroids.dist",
+  BPPARAM = BiocParallel::SerialParam()
+)
+
+saveRDS(tune_diablo, file.path(out_dir, "diablo_tuning_results.rds"))
+
+keepX_opt <- tune_diablo$choice.keepX
+print(keepX_opt)
+
+write.csv(
+  data.frame(
+    block = rep(names(keepX_opt), each = length(keepX_opt[[1]])),
+    component = rep(seq_along(keepX_opt[[1]]), times = length(keepX_opt)),
+    keepX = unlist(keepX_opt)
+  ),
+  file.path(out_dir, "diablo_optimal_keepX.csv"),
+  row.names = FALSE
+)
+
+# ============================================================
+# 8. fit tuned final model
+# ============================================================
+diablo_final <- block.splsda(
+  X = X,
+  Y = Y,
+  ncomp = ncomp_test,
+  keepX = keepX_opt,
+  design = design
+)
+
+saveRDS(diablo_final, file.path(out_dir, "diablo_final_model.rds"))
+
+# ============================================================
+# 9. performance assessment
+# ============================================================
+perf_diablo <- perf(
+  diablo_final,
+  validation = "Mfold",
+  folds = 5,
+  nrepeat = 20,
+  dist = "centroids.dist",
+  BPPARAM = BiocParallel::SerialParam()
+)
+
+saveRDS(perf_diablo, file.path(out_dir, "diablo_performance.rds"))
+
+# ============================================================
+# 10. selected features export
+# ============================================================
+extract_selected_vars <- function(model, block, comp) {
+  sv <- selectVar(model, block = block, comp = comp)
+
+  feats <- NULL
+  vals  <- NULL
+
+  if (!is.null(sv$name)) {
+    feats <- sv$name
+    if (is.list(feats)) feats <- feats[[comp]]
+  }
+
+  if (!is.null(sv$value)) {
+    vals <- sv$value
+    if (is.list(vals)) {
+      vals <- vals[[comp]]
+    } else if (is.matrix(vals) || is.data.frame(vals)) {
+      vals_df <- as.data.frame(vals, stringsAsFactors = FALSE)
+      if (nrow(vals_df) > 0) {
+        if (is.null(feats) || length(feats) == 0) {
+          feats <- rownames(vals_df)
+        }
+        vals <- suppressWarnings(as.numeric(vals_df[[1]]))
+      } else {
+        vals <- numeric(0)
+      }
+    } else {
+      vals <- suppressWarnings(as.numeric(vals))
+    }
+  }
+
+  if (is.null(feats) || length(feats) == 0) feats <- character(0)
+  if (is.null(vals) || length(vals) == 0) vals <- numeric(0)
+
+  n <- min(length(feats), length(vals))
+
+  if (n == 0) {
+    return(data.frame(
+      Feature = character(0),
+      Loading = numeric(0),
+      block = character(0),
+      component = integer(0),
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  data.frame(
+    Feature = as.character(feats[seq_len(n)]),
+    Loading = as.numeric(vals[seq_len(n)]),
+    block = rep(block, n),
+    component = rep(comp, n),
+    stringsAsFactors = FALSE
+  )
+}
+
+sel_microbe <- extract_selected_vars(diablo_final, block = "microbiome", comp = 1)
+sel_metab   <- extract_selected_vars(diablo_final, block = "metabolome", comp = 1)
+
+write.csv(sel_microbe, file.path(out_dir, "selected_microbiome_comp1.csv"), row.names = FALSE)
+write.csv(sel_metab,   file.path(out_dir, "selected_metabolome_comp1.csv"), row.names = FALSE)
+
+if (ncomp_test >= 2) {
+  sel_microbe_c2 <- extract_selected_vars(diablo_final, block = "microbiome", comp = 2)
+  sel_metab_c2   <- extract_selected_vars(diablo_final, block = "metabolome", comp = 2)
+
+  write.csv(sel_microbe_c2, file.path(out_dir, "selected_microbiome_comp2.csv"), row.names = FALSE)
+  write.csv(sel_metab_c2,   file.path(out_dir, "selected_metabolome_comp2.csv"), row.names = FALSE)
+}
+
+cat("Selected features exported.\n")
+cat("Comp1 microbiome:", nrow(sel_microbe), "features\n")
+cat("Comp1 metabolome:", nrow(sel_metab), "features\n")
+
+# ============================================================
+# 11. sample plots
+# ============================================================
+pdf(file.path(out_dir, "DIABLO_sample_plots.pdf"), width = 9, height = 7)
+
+plotIndiv(
+  diablo_final,
+  ind.names = FALSE,
+  legend = TRUE,
+  title = "DIABLO: sample separation by treatment",
+  ellipse = TRUE,
+  star = FALSE
+)
+
+plotIndiv(
+  diablo_final,
+  ind.names = FALSE,
+  legend = TRUE,
+  title = "DIABLO: consensus sample plot",
+  ellipse = TRUE,
+  style = "graphics",
+  study = "all.partial"
+)
+
+dev.off()
+
+# ============================================================
+# 12. variable plots / loadings
+# ============================================================
+pdf(file.path(out_dir, "DIABLO_variable_plots.pdf"), width = 10, height = 8)
+
+plotVar(
+  diablo_final,
+  comp = c(1, 2),
+  title = "DIABLO variable plot"
+)
+
+plotLoadings(
+  diablo_final,
+  block = "microbiome",
+  comp = 1,
+  method = "mean",
+  contrib = "max",
+  ndisplay = min(25, ncol(X$microbiome)),
+  title = "Microbiome loadings, comp 1"
+)
+
+plotLoadings(
+  diablo_final,
+  block = "metabolome",
+  comp = 1,
+  method = "mean",
+  contrib = "max",
+  ndisplay = min(25, ncol(X$metabolome)),
+  title = "Metabolome loadings, comp 1"
+)
+
+dev.off()
+
+# ============================================================
+# 13. clustered image map
+# ============================================================
+pdf(file.path(out_dir, "DIABLO_cim.pdf"), width = 12, height = 10)
+
+cimDiablo(
+  diablo_final,
+  comp = 1,
+  margins = c(8, 14)
+)
+
+dev.off()
+
+# ============================================================
+# 14. optional circos without outer radial lines
+# ============================================================
+pdf(file.path(out_dir, "DIABLO_circos_comp1_noLines.pdf"), width = 14, height = 14)
+circosPlot(
+  diablo_final,
+  comp = 1,
+  cutoff = 0.2,
+  line = FALSE,
+  size.variables = 0.9,
+  size.labels = 0.9
+)
+dev.off()
+
+# ============================================================
+# 15. network plot
+# ============================================================
+pdf(file.path(out_dir, "DIABLO_network_comp1.pdf"), width = 12, height = 10)
+network(
+  diablo_final,
+  cutoff = 0.4,
+  blocks = c(1, 2),
+  color.node = c("goldenrod3", "steelblue4"),
+  shape.node = c("circle", "rectangle")
+)
+dev.off()
+```
+
+```{r}
+extract_selected_vars <- function(model, block, comp = 1) {
+  sv <- selectVar(model, block = block, comp = comp)
+
+  # block-specific nested result
+  if (is.null(sv[[block]])) {
+    return(data.frame(
+      Feature = character(0),
+      Loading = numeric(0),
+      block = character(0),
+      component = integer(0),
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  block_res <- sv[[block]]
+
+  feats <- block_res$name
+  vals  <- block_res$value
+
+  # feature names
+  if (is.null(feats)) {
+    feats <- character(0)
+  } else {
+    feats <- as.character(feats)
+  }
+
+  # loadings
+  if (is.null(vals)) {
+    loadings <- rep(NA_real_, length(feats))
+  } else if (is.data.frame(vals) || is.matrix(vals)) {
+    vals_df <- as.data.frame(vals, stringsAsFactors = FALSE)
+
+    if (nrow(vals_df) == 0) {
+      loadings <- numeric(0)
+    } else {
+      num_cols <- which(vapply(vals_df, is.numeric, logical(1)))
+      if (length(num_cols) > 0) {
+        loadings <- as.numeric(vals_df[[num_cols[1]]])
+      } else {
+        loadings <- rep(NA_real_, nrow(vals_df))
+      }
+
+      # if names missing, try rownames of value table
+      if (length(feats) == 0 && !is.null(rownames(vals_df))) {
+        feats <- rownames(vals_df)
+      }
+    }
+  } else if (is.numeric(vals)) {
+    loadings <- as.numeric(vals)
+    if (length(feats) == 0 && !is.null(names(vals))) {
+      feats <- names(vals)
+    }
+  } else {
+    loadings <- rep(NA_real_, length(feats))
+  }
+
+  n_out <- min(length(feats), length(loadings))
+
+  if (n_out == 0) {
+    return(data.frame(
+      Feature = character(0),
+      Loading = numeric(0),
+      block = character(0),
+      component = integer(0),
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  data.frame(
+    Feature = feats[seq_len(n_out)],
+    Loading = loadings[seq_len(n_out)],
+    block = block,
+    component = comp,
+    stringsAsFactors = FALSE
+  )
+}
+
+sel_microbe <- extract_selected_vars(diablo_final, block = "microbiome", comp = 1)
+sel_metab   <- extract_selected_vars(diablo_final, block = "metabolome", comp = 1)
+
+write.csv(sel_microbe, file.path(out_dir, "selected_microbiome_comp1.csv"), row.names = FALSE)
+write.csv(sel_metab,   file.path(out_dir, "selected_metabolome_comp1.csv"), row.names = FALSE)
+
+if (ncomp_test >= 2) {
+  sel_microbe_c2 <- extract_selected_vars(diablo_final, block = "microbiome", comp = 2)
+  sel_metab_c2   <- extract_selected_vars(diablo_final, block = "metabolome", comp = 2)
+
+  write.csv(sel_microbe_c2, file.path(out_dir, "selected_microbiome_comp2.csv"), row.names = FALSE)
+  write.csv(sel_metab_c2,   file.path(out_dir, "selected_metabolome_comp2.csv"), row.names = FALSE)
+}
+
+cat("Selected features exported.\n")
+cat("Comp1 microbiome:", nrow(sel_microbe), "features\n")
+cat("Comp1 metabolome:", nrow(sel_metab), "features\n")
+print(head(sel_microbe))
+print(head(sel_metab))
+```
+
+
+```{r}
+# ============================================================
+# 16. build dodged bar plots for selected comp1 features
+# ============================================================
+genus_names <- as.character(genus_tax$Genus) %>% str_trim()
+genus_names[is.na(genus_names) | genus_names == "" |
+              tolower(genus_names) %in% c("none", "unclassified", "unknown")] <- "Unclassified"
+colnames(genus_mat) <- make.unique(genus_names)
+# ============================================================
+# 16. build dodged bar plots for selected comp1 features
+# ============================================================
+
+if (nrow(sel_microbe) == 0) stop("No selected microbiome features found for comp 1.")
+if (nrow(sel_metab) == 0) stop("No selected metabolite features found for comp 1.")
+
+microbe_ranked <- sel_microbe %>%
+  arrange(desc(abs(Loading))) %>%
+  pull(Feature) %>%
+  unique()
+
+metab_ranked <- sel_metab %>%
+  arrange(desc(abs(Loading))) %>%
+  pull(Feature) %>%
+  unique()
+
+microbe_feats <- head(microbe_ranked[microbe_ranked %in% colnames(genus_clr)], top_n_barplot)
+metab_feats   <- head(metab_ranked[metab_ranked %in% colnames(met_scaled)], top_n_barplot)
+
+microbe_levels <- microbe_feats
+metab_levels   <- metab_feats
+
+cat("Matched microbiome features:", length(microbe_feats), "\n")
+print(microbe_feats)
+
+cat("Matched metabolite features:", length(metab_feats), "\n")
+print(metab_feats)
+
+if (length(microbe_feats) == 0) stop("No microbiome features matched genus_clr.")
+if (length(metab_feats) == 0) stop("No metabolite features matched met_scaled.")
+
+microbe_df <- as.data.frame(genus_clr[, microbe_feats, drop = FALSE]) %>%
+  rownames_to_column("CanonicalID") %>%
+  pivot_longer(
+    cols = -CanonicalID,
+    names_to = "Feature",
+    values_to = "Value"
+  ) %>%
+  left_join(meta_diablo, by = "CanonicalID") %>%
+  mutate(
+    Feature = factor(Feature, levels = microbe_levels),
+    TreatmentGroup = factor(TreatmentGroup, levels = treatment_levels)
+  )
+
+metab_df <- as.data.frame(met_scaled[, metab_feats, drop = FALSE]) %>%
+  rownames_to_column("CanonicalID") %>%
+  pivot_longer(
+    cols = -CanonicalID,
+    names_to = "Feature",
+    values_to = "Value"
+  ) %>%
+  left_join(meta_diablo, by = "CanonicalID") %>%
+  mutate(
+    Feature = factor(Feature, levels = metab_levels),
+    TreatmentGroup = factor(TreatmentGroup, levels = treatment_levels)
+  )
+
+microbe_sum <- summarize_mean_sem(microbe_df) %>%
+  mutate(
+    Feature = factor(Feature, levels = microbe_levels),
+    TreatmentGroup = factor(TreatmentGroup, levels = treatment_levels)
+  )
+
+metab_sum <- summarize_mean_sem(metab_df) %>%
+  mutate(
+    Feature = factor(Feature, levels = metab_levels),
+    TreatmentGroup = factor(TreatmentGroup, levels = treatment_levels)
+  )
+
+write.csv(microbe_sum, file.path(out_dir, "DIABLO_barplot_summary_microbiome_comp1.csv"), row.names = FALSE)
+write.csv(metab_sum,   file.path(out_dir, "DIABLO_barplot_summary_metabolome_comp1.csv"), row.names = FALSE)
+
+# ============================================================
+# 17. plot selected microbiome features as dodged bars
+# ============================================================
+p_microbe <- ggplot(microbe_sum, aes(x = Feature, y = mean, fill = TreatmentGroup)) +
+  geom_col(
+    position = position_dodge(width = 0.8),
+    width = 0.72,
+    color = "black",
+    linewidth = 0.2
+  ) +
+  geom_errorbar(
+    aes(ymin = mean - sem, ymax = mean + sem),
+    position = position_dodge(width = 0.8),
+    width = 0.2,
+    linewidth = 0.3
+  ) +
+  scale_fill_manual(values = drug_cols, drop = FALSE) +
+  labs(
+    title = "Top DIABLO selected genera, component 1",
+    x = NULL,
+    y = "CLR abundance"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    legend.position = "top",
+    legend.title = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold")
+  )
+
+# ============================================================
+# 18. plot selected metabolite features as dodged bars
+# ============================================================
+p_metab <- ggplot(metab_sum, aes(x = Feature, y = mean, fill = TreatmentGroup)) +
+  geom_col(
+    position = position_dodge(width = 0.8),
+    width = 0.72,
+    color = "black",
+    linewidth = 0.2
+  ) +
+  geom_errorbar(
+    aes(ymin = mean - sem, ymax = mean + sem),
+    position = position_dodge(width = 0.8),
+    width = 0.2,
+    linewidth = 0.3
+  ) +
+  scale_fill_manual(values = drug_cols, drop = FALSE) +
+  labs(
+    title = "Top DIABLO selected metabolites, component 1",
+    x = NULL,
+    y = "Scaled intensity"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    legend.position = "top",
+    legend.title = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold")
+  )
+
+# combined bar plot figure
+pdf(file.path(out_dir, "DIABLO_barplots_comp1.pdf"), width = 16, height = 12)
+print(p_microbe / p_metab + plot_layout(heights = c(1, 1)))
+dev.off()
+
+# individual PDFs
+pdf(file.path(out_dir, "DIABLO_barplot_microbiome_comp1.pdf"), width = 14, height = 6)
+print(p_microbe)
+dev.off()
+
+pdf(file.path(out_dir, "DIABLO_barplot_metabolome_comp1.pdf"), width = 14, height = 6)
+print(p_metab)
+dev.off()
+
+# ============================================================
+# 19. optional faceted version with free y scales
+# Useful if you want each metabolite/genus easier to inspect
+# ============================================================
+p_microbe_facet <- ggplot(microbe_sum, aes(x = TreatmentGroup, y = mean, fill = TreatmentGroup)) +
+  geom_col(width = 0.72, color = "black", linewidth = 0.2) +
+  geom_errorbar(
+    aes(ymin = mean - sem, ymax = mean + sem),
+    width = 0.2,
+    linewidth = 0.3
+  ) +
+  scale_fill_manual(values = drug_cols, drop = FALSE) +
+  facet_wrap(~ Feature, scales = "free_y", ncol = 5) +
+  labs(
+    title = "Top DIABLO selected genera, component 1",
+    x = NULL,
+    y = "CLR abundance"
+  ) +
+  theme_bw(base_size = 10) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none",
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold")
+  )
+
+p_metab_facet <- ggplot(metab_sum, aes(x = TreatmentGroup, y = mean, fill = TreatmentGroup)) +
+  geom_col(width = 0.72, color = "black", linewidth = 0.2) +
+  geom_errorbar(
+    aes(ymin = mean - sem, ymax = mean + sem),
+    width = 0.2,
+    linewidth = 0.3
+  ) +
+  scale_fill_manual(values = drug_cols, drop = FALSE) +
+  facet_wrap(~ Feature, scales = "free_y", ncol = 5) +
+  labs(
+    title = "Top DIABLO selected metabolites, component 1",
+    x = NULL,
+    y = "Scaled intensity"
+  ) +
+  theme_bw(base_size = 10) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none",
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold")
+  )
+
+pdf(file.path(out_dir, "DIABLO_barplots_comp1_faceted.pdf"), width = 16, height = 12)
+print(p_microbe_facet / p_metab_facet + plot_layout(heights = c(1, 1)))
+dev.off()
+
+cat("Done. Outputs written to:\n", out_dir, "\n")
+```
